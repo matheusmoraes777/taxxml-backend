@@ -12,179 +12,156 @@ import mercadopago
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
-# FIREBASE - CONFIGURAÇÃO DE NUVEM (PRO)
+# SETUP: FLASK E FIREBASE
 # ==========================================
-import firebase_admin
-from firebase_admin import credentials, firestore
-
 app = Flask(__name__)
 CORS(app)
 
-# Lista de caminhos onde a chave pode estar (Render e PC)
-caminhos_possiveis = [
-    "/etc/secrets/firebase-key.json",  # Caminho padrão do Render
-    "/etc/secrets/key.json",           # Alternativo caso mude no painel
-    "firebase-key.json",               # Raiz do projeto (PC)
-    "key.json"                         # Raiz do projeto (PC alternativo)
-]
+import firebase_admin
+from firebase_admin import credentials, firestore
 
+caminhos_possiveis = ["/etc/secrets/firebase-key.json", "firebase-key.json", "key.json"]
 db = None
-chave_encontrada = None
-
 for caminho in caminhos_possiveis:
     if os.path.exists(caminho):
         try:
             cred = credentials.Certificate(caminho)
             firebase_admin.initialize_app(cred)
             db = firestore.client()
-            chave_encontrada = caminho
-            print(f"🔥 Firebase conectado com sucesso usando: {caminho}")
+            print(f"🔥 Firebase conectado via: {caminho}")
             break
-        except Exception as e:
-            print(f"Tentativa falhou em {caminho}: {e}")
-
-if db is None:
-    print("⚠️ ERRO CRÍTICO: Nenhuma chave Firebase encontrada nos caminhos verificados.")
+        except: pass
 
 # ==========================================
-# CONFIGURAÇÕES E CHAVES
+# CONFIGURAÇÕES DA APLICAÇÃO
 # ==========================================
 API_KEY_MEU_DANFE = "36da320b-1b2d-47fa-b626-cc90dea64471"
 MP_ACCESS_TOKEN = "APP_USR-1091359635861022-031115-4083f4ba9bf7da16cf148d67c053efdb-3243990562"
-PRECO_POR_XML = 0.08
+PRECO_POR_XML = 0.08  # O SEU PREÇO DE VENDA
 
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 tarefas_download = {}
 
 # ==========================================
-# FUNÇÕES DE BANCO DE DADOS
+# GESTÃO DE USUÁRIO E SALDO
 # ==========================================
-def salvar_venda(qtd, valor, metodo, email_cliente):
-    if db:
-        try:
-            db.collection('vendas').add({
-                'quantidade_xml': qtd,
-                'valor_total': valor,
-                'metodo': metodo,
-                'email': email_cliente,
-                'data_compra': datetime.datetime.now()
-            })
-        except Exception as e:
-            print(f"Erro ao gravar venda: {e}")
-
-# ==========================================
-# ROTAS DE USUÁRIO E ADMIN
-# ==========================================
-@app.route('/api/registrar', methods=['POST'])
-def registrar_usuario():
+@app.route('/api/sync-user', methods=['POST'])
+def sync_user():
     dados = request.json
-    if not db: return jsonify({"erro": "Banco de dados offline"}), 500
-    try:
-        users_ref = db.collection('usuarios')
-        docs = users_ref.where('email', '==', dados['email']).stream()
-        if len(list(docs)) > 0:
-            return jsonify({"erro": "E-mail já cadastrado!"}), 400
-        users_ref.add({
-            'nome': dados['nome'],
-            'email': dados['email'],
-            'senha': dados['senha'],
-            'data_criacao': datetime.datetime.now()
-        })
-        return jsonify({"sucesso": True, "mensagem": "Conta criada!"})
-    except Exception as e: return jsonify({"erro": str(e)}), 500
+    email = dados.get('email')
+    nome = dados.get('nome', 'Usuário')
+    if not db or not email: return jsonify({"erro": "Dados inválidos"}), 400
+    
+    user_ref = db.collection('usuarios').document(email)
+    doc = user_ref.get()
+    
+    if not doc.exists:
+        user_ref.set({'nome': nome, 'email': email, 'saldo': 0.0, 'data_criacao': datetime.datetime.now()})
+        return jsonify({"sucesso": True, "saldo": 0.0, "nome": nome})
+    
+    return jsonify({"sucesso": True, "saldo": doc.to_dict().get('saldo', 0.0), "nome": doc.to_dict().get('nome')})
 
 @app.route('/api/login', methods=['POST'])
-def fazer_login():
+def login():
     dados = request.json
-    if not db: return jsonify({"erro": "Banco de dados offline"}), 500
-    try:
-        docs = db.collection('usuarios').where('email', '==', dados['email']).where('senha', '==', dados['senha']).stream()
-        for doc in docs:
-            usuario = doc.to_dict()
-            return jsonify({"sucesso": True, "nome": usuario.get('nome')})
-        return jsonify({"erro": "E-mail ou senha incorretos."}), 401
-    except Exception as e: return jsonify({"erro": str(e)}), 500
+    if not db: return jsonify({"erro": "DB Offline"}), 500
+    doc = db.collection('usuarios').document(dados.get('email')).get()
+    if doc.exists and doc.to_dict().get('senha') == dados.get('senha'):
+        return jsonify({"sucesso": True, "nome": doc.to_dict().get('nome'), "saldo": doc.to_dict().get('saldo', 0.0)})
+    return jsonify({"erro": "Credenciais incorretas"}), 401
 
-@app.route('/api/admin/stats', methods=['GET'])
-def get_stats():
-    if not db: return jsonify({"total_xmls": 0, "faturamento": 0, "clientes_ativos": 0})
-    try:
-        vendas_docs = db.collection('vendas').stream()
-        total_xmls = 0
-        faturamento = 0.0
-        for venda in vendas_docs:
-            d = venda.to_dict()
-            total_xmls += d.get('quantidade_xml', 0)
-            faturamento += d.get('valor_total', 0.0)
-        clientes = sum(1 for _ in db.collection('usuarios').stream())
-        return jsonify({"total_xmls": total_xmls, "faturamento": faturamento, "clientes_ativos": clientes})
-    except:
-        return jsonify({"total_xmls": 0, "faturamento": 0.0, "clientes_ativos": 0})
+@app.route('/api/registrar', methods=['POST'])
+def registrar():
+    dados = request.json
+    if not db: return jsonify({"erro": "DB Offline"}), 500
+    user_ref = db.collection('usuarios').document(dados.get('email'))
+    if user_ref.get().exists: return jsonify({"erro": "E-mail já existe"}), 400
+    user_ref.set({'nome': dados['nome'], 'email': dados.get('email'), 'senha': dados.get('senha'), 'saldo': 0.0, 'data': datetime.datetime.now()})
+    return jsonify({"sucesso": True})
 
 # ==========================================
-# PAGAMENTOS
+# RECARGA DE CRÉDITOS (MERCADO PAGO)
 # ==========================================
-@app.route('/api/pagar-pix', methods=['POST'])
-def gerar_pix():
+@app.route('/api/comprar-creditos', methods=['POST'])
+def comprar_creditos():
     try:
         dados = request.json
-        qtd = dados.get('quantidade', 0)
-        email = dados.get('email', 'desconhecido')
-        valor = float(qtd * PRECO_POR_XML)
-        salvar_venda(qtd, valor, "PIX", email)
+        email = dados.get('email')
+        valor = float(dados.get('valor', 0))
+        if valor < 1: return jsonify({"erro": "Mínimo R$ 1,00"}), 400
+
         res = sdk.payment().create({
             "transaction_amount": valor,
-            "description": f"Tax XML - {qtd} notas",
+            "description": "Recarga de Saldo - Tax XML",
             "payment_method_id": "pix",
-            "payer": {"email": email if "@" in email else "cliente@taxxml.com"}
+            "payer": {"email": email}
         })["response"]
+        
+        if db:
+            db.collection('pagamentos_pendentes').document(str(res["id"])).set({
+                'email': email, 'valor': valor, 'status': 'pendente', 'data': datetime.datetime.now()
+            })
         return jsonify({"qr_code_base64": res["point_of_interaction"]["transaction_data"]["qr_code_base64"], "payment_id": res["id"]})
     except Exception as e: return jsonify({"erro": str(e)}), 400
 
-@app.route('/api/pagar-cartao', methods=['POST'])
-def gerar_cartao():
+@app.route('/api/verificar-pagamento/<int:pay_id>', methods=['GET'])
+def verificar_pagamento(pay_id):
     try:
-        dados = request.json
-        qtd = dados.get('quantidade', 0)
-        email = dados.get('email', 'desconhecido')
-        valor = float(qtd * PRECO_POR_XML)
-        salvar_venda(qtd, valor, "CARTAO", email)
-        rastreio = str(uuid.uuid4())
-        res = sdk.preference().create({
-            "items": [{"title": f"Tax XML - {qtd} notas", "quantity": 1, "unit_price": valor, "currency_id": "BRL"}],
-            "external_reference": rastreio,
-            "back_urls": {"success": "https://taxxml.com.br", "failure": "https://taxxml.com.br", "pending": "https://taxxml.com.br"},
-            "auto_return": "approved"
-        })["response"]
-        return jsonify({"checkout_url": res["init_point"], "rastreio": rastreio})
-    except Exception as e: return jsonify({"erro": str(e)}), 400
-
-@app.route('/api/status-pix/<int:pay_id>', methods=['GET'])
-def status_pix(pay_id):
-    status = sdk.payment().get(pay_id)["response"].get("status")
-    return jsonify({"pago": status == "approved"})
-
-@app.route('/api/status-cartao/<rastreio>', methods=['GET'])
-def status_cartao(rastreio):
-    busca = sdk.payment().search({"external_reference": rastreio})["response"].get("results", [])
-    pago = any(p.get("status") == "approved" for p in busca)
-    return jsonify({"pago": pago})
+        res = sdk.payment().get(pay_id)["response"]
+        if res.get("status") == "approved":
+            doc_ref = db.collection('pagamentos_pendentes').document(str(pay_id))
+            doc = doc_ref.get()
+            if doc.exists and doc.to_dict().get('status') == 'pendente':
+                dados = doc.to_dict()
+                user_ref = db.collection('usuarios').document(dados['email'])
+                saldo_atual = user_ref.get().to_dict().get('saldo', 0.0)
+                user_ref.update({'saldo': saldo_atual + dados['valor']})
+                doc_ref.update({'status': 'concluido'})
+                return jsonify({"pago": True, "novo_saldo": saldo_atual + dados['valor']})
+            return jsonify({"pago": True, "mensagem": "Já processado"})
+        return jsonify({"pago": False})
+    except Exception as e: return jsonify({"erro": str(e)}), 500
 
 # ==========================================
-# MOTOR DE DOWNLOAD (BACKGROUND)
+# DOWNLOAD COM DÉBITO NO SALDO
+# ==========================================
+@app.route('/api/iniciar-download', methods=['POST'])
+def iniciar_download():
+    dados = request.json
+    email = dados.get('email')
+    chaves = dados.get('chaves', [])
+    if not chaves or not email: return jsonify({"erro": "Dados incompletos"}), 400
+    
+    custo_total = len(chaves) * PRECO_POR_XML
+    user_ref = db.collection('usuarios').document(email)
+    saldo_atual = user_ref.get().to_dict().get('saldo', 0.0)
+    
+    if saldo_atual < custo_total:
+        return jsonify({"erro": "Saldo insuficiente"}), 402
+    
+    # Desconta o saldo
+    novo_saldo = saldo_atual - custo_total
+    user_ref.update({'saldo': novo_saldo})
+    
+    task_id = str(uuid.uuid4())
+    tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False, 'zip_bytes': None}
+    threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
+    
+    return jsonify({"task_id": task_id, "novo_saldo": novo_saldo})
+
+# ==========================================
+# MOTOR DE DOWNLOAD (THREADS)
 # ==========================================
 def baixar_xml_original(session, chave):
-    headers = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
-    url_get = f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}"
-    url_add = f"https://api.meudanfe.com.br/v2/fd/add/{chave}"
+    h = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
     try:
-        r = session.get(url_get, headers=headers, timeout=12)
+        r = session.get(f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}", headers=h, timeout=12)
         c = r.text.strip()
         xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
         if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
-        session.put(url_add, headers=headers, timeout=12)
+        session.put(f"https://api.meudanfe.com.br/v2/fd/add/{chave}", headers=h, timeout=12)
         time.sleep(5)
-        r = session.get(url_get, headers=headers, timeout=12)
+        r = session.get(f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}", headers=h, timeout=12)
         c = r.text.strip()
         xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
         if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
@@ -200,36 +177,28 @@ def processar_lote_bg(task_id, chaves):
                 futures = {exe.submit(baixar_xml_original, sess, c): c for c in chaves}
                 for i, j in enumerate(as_completed(futures)):
                     ok, ch, xml_data = j.result()
-                    if ok:
-                        zf.writestr(f"{ch}.xml", xml_data)
-                        sucessos += 1
+                    if ok: zf.writestr(f"{ch}.xml", xml_data); sucessos += 1
                     tarefas_download[task_id]['processados'] = i + 1
     tarefas_download[task_id]['sucessos'] = sucessos
     tarefas_download[task_id]['concluido'] = True
     tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
 
-@app.route('/api/iniciar-download', methods=['POST'])
-def iniciar_download():
-    chaves = request.json.get('chaves', [])
-    if not chaves: return jsonify({"erro": "Sem chaves"}), 400
-    task_id = str(uuid.uuid4())
-    tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'sucessos': 0, 'concluido': False, 'zip_bytes': None}
-    threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
-    return jsonify({"task_id": task_id})
-
 @app.route('/api/progresso/<task_id>', methods=['GET'])
 def ver_progresso(task_id):
     tarefa = tarefas_download.get(task_id)
-    if not tarefa: return jsonify({"erro": "Tarefa não encontrada"}), 404
-    return jsonify({"processados": tarefa['processados'], "total": tarefa['total'], "concluido": tarefa['concluido']})
+    return jsonify(tarefa) if tarefa else ({"erro": "404"}, 404)
 
 @app.route('/api/baixar-zip/<task_id>', methods=['GET'])
 def baixar_zip(task_id):
     tarefa = tarefas_download.get(task_id)
-    if not tarefa or not tarefa['concluido']: return jsonify({"erro": "Ainda não está pronto"}), 400
     return send_file(io.BytesIO(tarefa['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
+
+# ADMIN STATS SIMPLIFICADO
+@app.route('/api/admin/stats', methods=['GET'])
+def admin_stats():
+    if not db: return jsonify({"clientes": 0})
+    return jsonify({"clientes": sum(1 for _ in db.collection('usuarios').stream())})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
-
