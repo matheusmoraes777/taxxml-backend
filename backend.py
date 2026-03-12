@@ -12,146 +12,173 @@ import mercadopago
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
-# FIREBASE - CONFIGURAÇÃO (SEM TRAVAR)
+# CONFIGURAÇÃO INICIAL E FIREBASE
 # ==========================================
-import firebase_admin
-from firebase_admin import credentials, firestore
-
 app = Flask(__name__)
 CORS(app)
 
-# Caminhos da chave (Render e Local)
-caminhos_possiveis = ["/etc/secrets/firebase-key.json", "firebase-key.json"]
-db = None
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-for caminho in caminhos_possiveis:
+# Busca a chave no Render ou Localmente
+caminhos_chave = ["/etc/secrets/firebase-key.json", "firebase-key.json"]
+db = None
+for caminho in caminhos_chave:
     if os.path.exists(caminho):
         try:
             cred = credentials.Certificate(caminho)
             firebase_admin.initialize_app(cred)
             db = firestore.client()
-            print(f"🔥 Firebase conectado com sucesso: {caminho}")
+            print(f"🔥 Firebase Conectado via: {caminho}")
             break
         except: pass
 
 # ==========================================
-# CONFIGURAÇÕES MERCADO PAGO E MEU DANFE
+# CHAVES DE API
 # ==========================================
 API_KEY_MEU_DANFE = "36da320b-1b2d-47fa-b626-cc90dea64471"
 MP_ACCESS_TOKEN = "APP_USR-1091359635861022-031115-4083f4ba9bf7da16cf148d67c053efdb-3243990562"
 PRECO_POR_XML = 0.15
 
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-tarefas_download = {}
-
-def salvar_venda_silencioso(qtd, valor, metodo, email_cliente):
-    """Salva no banco sem interromper o fluxo principal se falhar"""
-    if db:
-        try:
-            db.collection('vendas').add({
-                'quantidade_xml': qtd,
-                'valor_total': valor,
-                'metodo': metodo,
-                'email': email_cliente,
-                'data_compra': datetime.datetime.now()
-            })
-        except Exception as e:
-            print(f"⚠️ Log Firebase falhou: {e}")
+tarefas_download = {} # Armazena progresso dos zips em memória
 
 # ==========================================
-# ROTAS DE PAGAMENTO (REVISADAS)
+# ROTAS DE USUÁRIO (LOGIN / REGISTRO)
 # ==========================================
+@app.route('/api/registrar', methods=['POST'])
+def registrar():
+    if not db: return jsonify({"erro": "Banco offline"}), 500
+    dados = request.json
+    try:
+        users_ref = db.collection('usuarios')
+        if len(list(users_ref.where('email', '==', dados['email']).stream())) > 0:
+            return jsonify({"erro": "E-mail já cadastrado"}), 400
+        users_ref.add({
+            'nome': dados['nome'], 'email': dados['email'], 
+            'senha': dados['senha'], 'data': datetime.datetime.now()
+        })
+        return jsonify({"sucesso": True})
+    except Exception as e: return jsonify({"erro": str(e)}), 500
 
+@app.route('/api/login', methods=['POST'])
+def login():
+    if not db: return jsonify({"erro": "Banco offline"}), 500
+    dados = request.json
+    docs = db.collection('usuarios').where('email', '==', dados['email']).where('senha', '==', dados['senha']).stream()
+    for doc in docs: return jsonify({"sucesso": True, "nome": doc.to_dict().get('nome')})
+    return jsonify({"erro": "Dados incorretos"}), 401
+
+# ==========================================
+# ROTA ADMIN (DASHBOARD REAL)
+# ==========================================
+@app.route('/api/admin/stats', methods=['GET'])
+def get_stats():
+    if not db: return jsonify({"total_xmls": 0, "faturamento": 0, "clientes_ativos": 0})
+    try:
+        vendas = db.collection('vendas').stream()
+        t_xml = 0
+        fat = 0.0
+        for v in vendas:
+            d = v.to_dict()
+            t_xml += d.get('quantidade_xml', 0)
+            fat += d.get('valor_total', 0.0)
+        u_count = sum(1 for _ in db.collection('usuarios').stream())
+        return jsonify({"total_xmls": t_xml, "faturamento": fat, "clientes_ativos": u_count})
+    except: return jsonify({"erro": "erro stats"}), 500
+
+# ==========================================
+# ROTAS DE PAGAMENTO (MERCADO PAGO)
+# ==========================================
 @app.route('/api/pagar-pix', methods=['POST'])
 def gerar_pix():
     try:
         dados = request.json
         qtd = int(dados.get('quantidade', 0))
         email = dados.get('email', 'cliente@taxxml.com')
-        valor = round(float(qtd * PRECO_POR_XML), 2)
-
-        if valor < 0.50: # Valor mínimo para evitar erros no MP
-            return jsonify({"erro": "Valor muito baixo para gerar PIX"}), 400
+        valor = float(qtd * PRECO_POR_XML)
 
         res = sdk.payment().create({
             "transaction_amount": valor,
-            "description": f"Tax XML - {qtd} notas",
+            "description": f"Download {qtd} XMLs - TaxXML",
             "payment_method_id": "pix",
             "payer": {"email": email if "@" in email else "comprador@taxxml.com"}
-        })
+        })["response"]
 
-        if res["status"] == 201 or res["status"] == 200:
-            salvar_venda_silencioso(qtd, valor, "PIX", email)
-            return jsonify({
-                "qr_code_base64": res["response"]["point_of_interaction"]["transaction_data"]["qr_code_base64"],
-                "payment_id": res["response"]["id"]
-            })
-        return jsonify({"erro": "Mercado Pago recusou a criação do PIX"}), 400
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
+        # Salva log da venda no Firebase (Silencioso)
+        if db:
+            try:
+                db.collection('vendas').add({
+                    'quantidade_xml': qtd, 'valor_total': valor, 
+                    'email': email, 'metodo': 'PIX', 'data_compra': datetime.datetime.now()
+                })
+            except: pass
 
-@app.route('/api/pagar-cartao', methods=['POST'])
-def gerar_cartao():
-    try:
-        dados = request.json
-        qtd = int(dados.get('quantidade', 0))
-        email = dados.get('email', 'cliente@taxxml.com')
-        valor = round(float(qtd * PRECO_POR_XML), 2)
+        return jsonify({"qr_code_base64": res["point_of_interaction"]["transaction_data"]["qr_code_base64"], "payment_id": res["id"]})
+    except Exception as e: return jsonify({"erro": str(e)}), 400
 
-        res = sdk.preference().create({
-            "items": [{"title": f"Lote {qtd} XMLs", "quantity": 1, "unit_price": valor, "currency_id": "BRL"}],
-            "payer": {"email": email if "@" in email else "comprador@taxxml.com"},
-            "auto_return": "approved",
-            "back_urls": {"success": "https://taxxml.com.br", "failure": "https://taxxml.com.br"}
-        })
-
-        if res["status"] == 201 or res["status"] == 200:
-            salvar_venda_silencioso(qtd, valor, "CARTAO", email)
-            return jsonify({"checkout_url": res["response"]["init_point"]})
-        return jsonify({"erro": "Erro ao criar preferência de cartão"}), 400
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
+@app.route('/api/status-pix/<int:pay_id>', methods=['GET'])
+def status_pix(pay_id):
+    res = sdk.payment().get(pay_id)
+    return jsonify({"pago": res["response"].get("status") == "approved"})
 
 # ==========================================
-# OUTRAS ROTAS (LOGIN, ADMIN, DOWNLOAD)
+# MOTOR DE DOWNLOAD (THREADS EM LOTE)
 # ==========================================
-
-@app.route('/api/admin/stats', methods=['GET'])
-def get_stats():
-    if not db: return jsonify({"total_xmls": 0, "faturamento": 0, "clientes_ativos": 0})
+def baixar_xml_original(session, chave):
+    headers = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
     try:
-        vendas = db.collection('vendas').stream()
-        total_xmls = 0
-        faturamento = 0.0
-        for v in vendas:
-            d = v.to_dict()
-            total_xmls += d.get('quantidade_xml', 0)
-            faturamento += d.get('valor_total', 0.0)
-        clientes = sum(1 for _ in db.collection('usuarios').stream())
-        return jsonify({"total_xmls": total_xmls, "faturamento": faturamento, "clientes_ativos": clientes})
-    except: return jsonify({"erro": "stats fail"}), 500
+        r = session.get(f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}", headers=headers, timeout=12)
+        c = r.text.strip()
+        xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
+        if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
+        
+        session.put(f"https://api.meudanfe.com.br/v2/fd/add/{chave}", headers=headers, timeout=12)
+        time.sleep(5)
+        
+        r = session.get(f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}", headers=headers, timeout=12)
+        c = r.text.strip()
+        xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
+        if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
+    except: pass
+    return False, chave, None
 
-@app.route('/api/registrar', methods=['POST'])
-def registrar():
-    dados = request.json
-    if not db: return jsonify({"erro": "DB Offline"}), 500
-    db.collection('usuarios').add({'nome': dados['nome'], 'email': dados['email'], 'senha': dados['senha'], 'data_criacao': datetime.datetime.now()})
-    return jsonify({"sucesso": True})
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    dados = request.json
-    docs = db.collection('usuarios').where('email', '==', dados['email']).where('senha', '==', dados['senha']).stream()
-    for doc in docs: return jsonify({"sucesso": True, "nome": doc.to_dict().get('nome')})
-    return jsonify({"erro": "Incorreto"}), 401
+def processar_lote_bg(task_id, chaves):
+    zip_buf = io.BytesIO()
+    sucessos = 0
+    with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
+        with requests.Session() as sess:
+            with ThreadPoolExecutor(max_workers=15) as exe:
+                futures = {exe.submit(baixar_xml_original, sess, c): c for c in chaves}
+                for i, j in enumerate(as_completed(futures)):
+                    ok, ch, xml_data = j.result()
+                    if ok:
+                        zf.writestr(f"{ch}.xml", xml_data)
+                        sucessos += 1
+                    tarefas_download[task_id]['processados'] = i + 1
+    tarefas_download[task_id]['sucessos'] = sucessos
+    tarefas_download[task_id]['concluido'] = True
+    tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
 
 @app.route('/api/iniciar-download', methods=['POST'])
 def iniciar_download():
     chaves = request.json.get('chaves', [])
     task_id = str(uuid.uuid4())
     tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False, 'zip_bytes': None}
-    # Aqui entraria a lógica de Thread do processar_lote_bg (mesma de antes)
+    threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
     return jsonify({"task_id": task_id})
+
+@app.route('/api/progresso/<task_id>', methods=['GET'])
+def ver_progresso(task_id):
+    t = tarefas_download.get(task_id)
+    if not t: return jsonify({"erro": "404"}), 404
+    return jsonify({"processados": t['processados'], "total": t['total'], "concluido": t['concluido']})
+
+@app.route('/api/baixar-zip/<task_id>', methods=['GET'])
+def baixar_zip(task_id):
+    t = tarefas_download.get(task_id)
+    if not t or not t['concluido']: return jsonify({"erro": "Aguarde"}), 400
+    return send_file(io.BytesIO(t['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
