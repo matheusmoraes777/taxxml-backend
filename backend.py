@@ -1,231 +1,128 @@
-import os
-import time
-import uuid
-import zipfile
-import io
-import threading
-import datetime
-import requests
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import mercadopago
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import { useState, useEffect } from 'react'
+import { CreditCard, QrCode, Download, Loader2, Users, BarChart3, ShieldCheck, LogOut, ArrowRight, UserPlus, Activity, DollarSign } from 'lucide-react'
+import { auth, loginComGoogle, sairDaConta } from './firebase'
+import { onAuthStateChanged } from 'firebase/auth'
 
-# ==========================================
-# FIREBASE - CONFIGURAÇÃO DE NUVEM
-# ==========================================
-import firebase_admin
-from firebase_admin import credentials, firestore
+const API_URL = 'https://taxxml-api.onrender.com'
 
-app = Flask(__name__)
-CORS(app)
+function App() {
+  const [usuario, setUsuario] = useState(null)
+  const [isAdmin, setIsAdmin] = useState(false) 
+  const [view, setView] = useState('login')
+  const [loading, setLoading] = useState(false)
+  const [keys, setKeys] = useState('')
+  const [qrBase64, setQrBase64] = useState('')
+  const [checkoutUrl, setCheckoutUrl] = useState('')
+  const [payId, setPayId] = useState(null)
+  const [email, setEmail] = useState('')
+  const [senha, setSenha] = useState('')
+  const [nome, setNome] = useState('')
+  const [adminStats, setAdminStats] = useState({ total_xmls: 0, faturamento: 0, clientes_ativos: 0, atividades: [] })
 
-# Tenta os caminhos oficiais do Render e o local
-caminhos_possiveis = ["/etc/secrets/firebase-key.json", "firebase-key.json"]
-db = None
+  const validKeys = keys.split('\n').map(k => k.trim()).filter(k => k.length === 44)
+  const total = validKeys.length
+  const totalPrice = (total * 0.15).toFixed(2)
 
-for caminho in caminhos_possiveis:
-    if os.path.exists(caminho):
-        try:
-            cred = credentials.Certificate(caminho)
-            firebase_admin.initialize_app(cred)
-            db = firestore.client()
-            print(f"🔥 Firebase conectado com sucesso usando: {caminho}")
-            break
-        except Exception as e:
-            print(f"Erro ao tentar {caminho}: {e}")
+  useEffect(() => {
+    onAuthStateChanged(auth, (user) => { if (user) { setUsuario(user); setView('customer'); } });
+  }, []);
 
-if db is None:
-    print("⚠️ ERRO CRÍTICO: Nenhuma chave Firebase encontrada.")
+  useEffect(() => {
+    if (isAdmin) {
+      const fetchStats = async () => {
+        try { const res = await fetch(`${API_URL}/api/admin/stats`); setAdminStats(await res.json()); } catch (e) {}
+      };
+      fetchStats();
+    }
+  }, [isAdmin]);
 
-# ==========================================
-# CONFIGURAÇÕES E CHAVES
-# ==========================================
-API_KEY_MEU_DANFE = "36da320b-1b2d-47fa-b626-cc90dea64471"
-MP_ACCESS_TOKEN = "APP_USR-1091359635861022-031115-4083f4ba9bf7da16cf148d67c053efdb-3243990562"
-PRECO_POR_XML = 0.07
+  const handlePagamento = async (tipo) => {
+    if (total === 0) return alert("Cole as chaves primeiro!");
+    setLoading(true); setQrBase64(''); setCheckoutUrl('');
+    try {
+      const res = await fetch(`${API_URL}/api/pagar-${tipo}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quantidade: total, email: usuario?.email || 'anonimo@taxxml.com' })
+      });
+      const data = await res.json();
+      if (data.qr_code_base64) { setQrBase64(data.qr_code_base64); setPayId(data.payment_id); }
+      else if (data.checkout_url) { setCheckoutUrl(data.checkout_url); }
+      else { alert(data.erro || "Erro ao gerar pagamento"); }
+    } catch (e) { alert("Erro de conexão com o servidor."); }
+    setLoading(false);
+  }
 
-sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-tarefas_download = {}
+  if (view === 'login') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 p-6 font-sans">
+        <div className="bg-white p-8 rounded-3xl shadow-xl w-full max-w-md border">
+          <div className="flex justify-center mb-6"><img src="https://i.ibb.co/7x0Qyqr8/taxxml-logo.jpg" alt="Logo" className="w-64" /></div>
+          <div className="space-y-4">
+            <input type="email" placeholder="E-mail" value={email} onChange={e => setEmail(e.target.value)} className="w-full p-4 bg-slate-50 border rounded-xl" />
+            <input type="password" placeholder="Senha" value={senha} onChange={e => setSenha(e.target.value)} className="w-full p-4 bg-slate-50 border rounded-xl" />
+            <button onClick={() => { /* Função de login aqui */ }} className="w-full py-4 bg-slate-800 text-white font-bold rounded-xl">Entrar</button>
+            <button onClick={() => loginComGoogle()} className="w-full py-3 border-2 rounded-xl font-bold flex justify-center items-center gap-3"><img src="https://img.icons8.com/color/24/google-logo.png" /> Google</button>
+            <div className="flex justify-between pt-4"><button onClick={() => setView('register')} className="text-sky-600 font-bold">Criar Conta</button><button onClick={() => { const s = prompt("Senha:"); if(s==="123456Mat"){setIsAdmin(true); setView('admin');} }} className="text-slate-200"><ShieldCheck/></button></div>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
-# ==========================================
-# FUNÇÕES DE BANCO DE DADOS (FIRESTORE)
-# ==========================================
-def salvar_venda(qtd, valor, metodo, email_cliente):
-    if db:
-        try:
-            db.collection('vendas').add({
-                'quantidade_xml': qtd,
-                'valor_total': valor,
-                'metodo': metodo,
-                'email': email_cliente,
-                'data_compra': datetime.datetime.now()
-            })
-        except Exception as e: print(f"Erro ao gravar venda: {e}")
+  if (view === 'customer') {
+    return (
+      <div className="min-h-screen bg-slate-50 p-8 font-sans">
+        <div className="max-w-6xl mx-auto">
+          <header className="flex justify-between items-center mb-10 bg-white p-6 rounded-2xl border shadow-sm">
+            <h1 className="text-2xl font-black text-slate-800">Tax XML</h1>
+            <div className="flex gap-3">
+              {isAdmin && <button onClick={() => setView('admin')} className="px-4 py-2 bg-sky-100 text-sky-700 rounded-xl font-bold">Admin</button>}
+              <button onClick={() => { sairDaConta(); setView('login'); }} className="px-4 py-2 bg-red-50 text-red-600 rounded-xl font-bold">Sair</button>
+            </div>
+          </header>
+          <div className="grid lg:grid-cols-3 gap-8">
+            <div className="lg:col-span-2 bg-white p-8 rounded-3xl border shadow-sm">
+              <h2 className="text-xl font-bold mb-4 flex gap-2"><Download className="text-sky-500"/> 1. Chaves</h2>
+              <textarea className="w-full h-72 p-5 bg-slate-50 border rounded-2xl font-mono text-sm" placeholder="Cole aqui..." value={keys} onChange={e => setKeys(e.target.value)} />
+            </div>
+            <div className="bg-white p-8 rounded-3xl border shadow-sm text-center">
+              <h2 className="text-xl font-bold mb-6">2. Pagamento</h2>
+              <div className="text-4xl font-black text-emerald-500 mb-6">R$ {totalPrice}</div>
+              {loading ? <Loader2 className="animate-spin mx-auto w-10 h-10 text-sky-500" /> : (
+                <>
+                  {!qrBase64 && !checkoutUrl && (
+                    <div className="space-y-3">
+                      <button onClick={() => handlePagamento('pix')} className="w-full py-4 bg-emerald-500 text-white font-bold rounded-xl flex justify-center items-center gap-2"><QrCode/> Gerar PIX</button>
+                      <button onClick={() => handlePagamento('cartao')} className="w-full py-4 bg-slate-800 text-white font-bold rounded-xl flex justify-center items-center gap-2"><CreditCard/> Cartão</button>
+                    </div>
+                  )}
+                  {qrBase64 && <div className="space-y-4"><img src={`data:image/png;base64,${qrBase64}`} className="mx-auto border p-2 rounded-xl" /><p className="text-xs font-bold text-slate-500">Escaneie o QR Code acima</p></div>}
+                  {checkoutUrl && <a href={checkoutUrl} target="_blank" className="block py-4 bg-sky-500 text-white font-bold rounded-xl">Abrir Checkout</a>}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
-# ==========================================
-# ROTAS DE ADMIN (ESTATÍSTICAS REAIS)
-# ==========================================
-@app.route('/api/admin/stats', methods=['GET'])
-def get_stats():
-    if not db: return jsonify({"total_xmls": 0, "faturamento": 0, "clientes_ativos": 0, "atividades": []})
-    try:
-        # Busca faturamento e total de XMLs
-        vendas_docs = db.collection('vendas').stream()
-        total_xmls = 0
-        faturamento = 0.0
-        for venda in vendas_docs:
-            d = venda.to_dict()
-            total_xmls += d.get('quantidade_xml', 0)
-            faturamento += d.get('valor_total', 0.0)
-            
-        # Busca as últimas 5 atividades para o Feed
-        vendas_query = db.collection('vendas').order_by('data_compra', direction=firestore.Query.DESCENDING).limit(5).stream()
-        atividades = []
-        for v in vendas_query:
-            d = v.to_dict()
-            atividades.append({
-                "u": d.get('email', 'User').split('@')[0],
-                "a": f"Comprou {d.get('quantidade_xml')} XMLs via {d.get('metodo')}",
-                "t": "Agora",
-                "c": "text-emerald-400"
-            })
-            
-        clientes = sum(1 for _ in db.collection('usuarios').stream())
-        return jsonify({
-            "total_xmls": total_xmls, 
-            "faturamento": faturamento, 
-            "clientes_ativos": clientes,
-            "atividades": atividades
-        })
-    except Exception as e:
-        print(f"Erro Stats: {e}")
-        return jsonify({"total_xmls": 0, "faturamento": 0, "clientes_ativos": 0, "atividades": []})
-
-# ==========================================
-# ROTAS DE USUÁRIO (LOGIN / REGISTRO)
-# ==========================================
-@app.route('/api/registrar', methods=['POST'])
-def registrar_usuario():
-    dados = request.json
-    if not db: return jsonify({"erro": "DB Offline"}), 500
-    try:
-        users_ref = db.collection('usuarios')
-        if len(list(users_ref.where('email', '==', dados['email']).stream())) > 0:
-            return jsonify({"erro": "E-mail já cadastrado!"}), 400
-        users_ref.add({'nome': dados['nome'], 'email': dados['email'], 'senha': dados['senha'], 'data_criacao': datetime.datetime.now()})
-        return jsonify({"sucesso": True, "mensagem": "Conta criada!"})
-    except Exception as e: return jsonify({"erro": str(e)}), 500
-
-@app.route('/api/login', methods=['POST'])
-def fazer_login():
-    dados = request.json
-    try:
-        docs = db.collection('usuarios').where('email', '==', dados['email']).where('senha', '==', dados['senha']).stream()
-        for doc in docs: return jsonify({"sucesso": True, "nome": doc.to_dict().get('nome')})
-        return jsonify({"erro": "Credenciais incorretas."}), 401
-    except Exception as e: return jsonify({"erro": str(e)}), 500
-
-# ==========================================
-# PAGAMENTOS (PIX E CARTÃO)
-# ==========================================
-@app.route('/api/pagar-pix', methods=['POST'])
-def gerar_pix():
-    try:
-        qtd = request.json.get('quantidade', 0)
-        email = request.json.get('email', 'cliente@taxxml.com')
-        valor = float(qtd * PRECO_POR_XML)
-        salvar_venda(qtd, valor, "PIX", email)
-        res = sdk.payment().create({
-            "transaction_amount": valor, "description": f"Tax XML - {qtd} notas",
-            "payment_method_id": "pix", "payer": {"email": email if "@" in email else "cliente@taxxml.com"}
-        })["response"]
-        return jsonify({"qr_code_base64": res["point_of_interaction"]["transaction_data"]["qr_code_base64"], "payment_id": res["id"]})
-    except Exception as e: return jsonify({"erro": str(e)}), 400
-
-@app.route('/api/pagar-cartao', methods=['POST'])
-def gerar_cartao():
-    try:
-        qtd = request.json.get('quantidade', 0)
-        email = request.json.get('email', 'cliente@taxxml.com')
-        valor = float(qtd * PRECO_POR_XML)
-        salvar_venda(qtd, valor, "CARTAO", email)
-        rastreio = str(uuid.uuid4())
-        res = sdk.preference().create({
-            "items": [{"title": f"Tax XML - {qtd} notas", "quantity": 1, "unit_price": valor, "currency_id": "BRL"}],
-            "external_reference": rastreio,
-            "back_urls": {"success": "https://taxxml.com.br", "failure": "https://taxxml.com.br", "pending": "https://taxxml.com.br"},
-            "auto_return": "approved"
-        })["response"]
-        return jsonify({"checkout_url": res["init_point"], "rastreio": rastreio})
-    except Exception as e: return jsonify({"erro": str(e)}), 400
-
-@app.route('/api/status-pix/<int:pay_id>', methods=['GET'])
-def status_pix(pay_id):
-    return jsonify({"pago": sdk.payment().get(pay_id)["response"].get("status") == "approved"})
-
-@app.route('/api/status-cartao/<rastreio>', methods=['GET'])
-def status_cartao(rastreio):
-    busca = sdk.payment().search({"external_reference": rastreio})["response"].get("results", [])
-    return jsonify({"pago": any(p.get("status") == "approved" for p in busca)})
-
-# ==========================================
-# MOTOR DE DOWNLOAD
-# ==========================================
-def baixar_xml_original(session, chave):
-    h = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
-    try:
-        r = session.get(f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}", headers=h, timeout=12)
-        c = r.text.strip()
-        xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
-        if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
-        session.put(f"https://api.meudanfe.com.br/v2/fd/add/{chave}", headers=h, timeout=12)
-        time.sleep(5)
-        r = session.get(f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}", headers=h, timeout=12)
-        c = r.text.strip()
-        xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
-        if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
-    except: pass
-    return False, chave, None
-
-def processar_lote_bg(task_id, chaves):
-    zip_buf = io.BytesIO()
-    sucessos = 0
-    with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
-        with requests.Session() as sess:
-            with ThreadPoolExecutor(max_workers=15) as exe:
-                futures = {exe.submit(baixar_xml_original, sess, c): c for c in chaves}
-                for i, j in enumerate(as_completed(futures)):
-                    ok, ch, xml_data = j.result()
-                    if ok:
-                        zf.writestr(f"{ch}.xml", xml_data)
-                        sucessos += 1
-                    tarefas_download[task_id]['processados'] = i + 1
-    tarefas_download[task_id]['sucessos'] = sucessos
-    tarefas_download[task_id]['concluido'] = True
-    tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
-
-@app.route('/api/iniciar-download', methods=['POST'])
-def iniciar_download():
-    chaves = request.json.get('chaves', [])
-    if not chaves: return jsonify({"erro": "Sem chaves"}), 400
-    task_id = str(uuid.uuid4())
-    tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'sucessos': 0, 'concluido': False, 'zip_bytes': None}
-    threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
-    return jsonify({"task_id": task_id})
-
-@app.route('/api/progresso/<task_id>', methods=['GET'])
-def ver_progresso(task_id):
-    t = tarefas_download.get(task_id)
-    if not t: return jsonify({"erro": "404"}), 404
-    return jsonify({"processados": t['processados'], "total": t['total'], "concluido": t['concluido']})
-
-@app.route('/api/baixar-zip/<task_id>', methods=['GET'])
-def baixar_zip(task_id):
-    t = tarefas_download.get(task_id)
-    if not t or not t['concluido']: return jsonify({"erro": "Aguarde"}), 400
-    return send_file(io.BytesIO(t['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+  if (view === 'admin') {
+     return (
+      <div className="min-h-screen bg-[#0f172a] text-slate-300 p-8 flex flex-col items-center">
+        <div className="w-full max-w-5xl flex justify-between items-center mb-8">
+          <h1 className="text-3xl font-black text-white flex gap-3"><ShieldCheck className="text-sky-500"/> Painel Admin</h1>
+          <button onClick={() => setView('customer')} className="bg-slate-800 px-6 py-2 rounded-xl font-bold">Voltar</button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 w-full max-w-5xl">
+            <div className="bg-[#1e293b] p-8 rounded-2xl border border-slate-800"><div className="text-slate-400 text-sm font-bold uppercase mb-2">Faturamento</div><div className="text-4xl font-black text-emerald-400">R$ {adminStats.faturamento.toFixed(2)}</div></div>
+            <div className="bg-[#1e293b] p-8 rounded-2xl border border-slate-800"><div className="text-slate-400 text-sm font-bold uppercase mb-2">XMLs Totais</div><div className="text-4xl font-black text-white">{adminStats.total_xmls}</div></div>
+            <div className="bg-[#1e293b] p-8 rounded-2xl border border-slate-800"><div className="text-slate-400 text-sm font-bold uppercase mb-2">Clientes</div><div className="text-4xl font-black text-white">{adminStats.clientes_ativos}</div></div>
+        </div>
+      </div>
+    )
+  }
+  return null;
+}
+export default App;
