@@ -51,7 +51,7 @@ if db is None:
 # ==========================================
 API_KEY_MEU_DANFE = "36da320b-1b2d-47fa-b626-cc90dea64471"
 MP_ACCESS_TOKEN = "APP_USR-1091359635861022-031115-4083f4ba9bf7da16cf148d67c053efdb-3243990562"
-PRECO_POR_XML = 0.06
+PRECO_POR_XML = 0.08
 
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 tarefas_download = {}
@@ -232,3 +232,4 @@ def baixar_zip(task_id):
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
