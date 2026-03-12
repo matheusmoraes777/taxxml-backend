@@ -1,204 +1,431 @@
-import os
-import time
-import uuid
-import zipfile
-import io
-import threading
-import datetime
-import requests
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import mercadopago
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import { useState, useEffect } from 'react'
+import { FileText, Download, Loader2, LogOut, Wallet, CheckCircle, Clock, Settings, User, PlusCircle, ShieldCheck, QrCode, UserPlus, ArrowRight, BarChart3, Users, DollarSign, Activity } from 'lucide-react'
+import { auth, loginComGoogle, sairDaConta } from './firebase'
+import { onAuthStateChanged } from 'firebase/auth'
 
-# ==========================================
-# SETUP: FLASK E FIREBASE
-# ==========================================
-app = Flask(__name__)
-CORS(app)
+const API_URL = 'https://taxxml-api.onrender.com'
+const PRECO_XML = 0.08
 
-import firebase_admin
-from firebase_admin import credentials, firestore
+function App() {
+  const [usuario, setUsuario] = useState(null)
+  const [saldo, setSaldo] = useState(0.0)
+  const [view, setView] = useState('login') // login, register, app, admin
+  const [activeTab, setActiveTab] = useState('download') 
+  const [isAdmin, setIsAdmin] = useState(false)
+  
+  // States Download
+  const [keys, setKeys] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [progress, setProgress] = useState({ ativo: false, processados: 0, total: 0, concluido: false, taskId: null })
+  
+  // States Crédito e Admin
+  const [valorCustom, setValorCustom] = useState('')
+  const [qrBase64, setQrBase64] = useState('')
+  const [payId, setPayId] = useState(null)
+  const [adminStats, setAdminStats] = useState({ clientes: 0 })
+  
+  // Dados de Login e Registro
+  const [nome, setNome] = useState('')
+  const [email, setEmail] = useState('')
+  const [senha, setSenha] = useState('')
 
-caminhos_possiveis = ["/etc/secrets/firebase-key.json", "firebase-key.json", "key.json"]
-db = None
-for caminho in caminhos_possiveis:
-    if os.path.exists(caminho):
-        try:
-            cred = credentials.Certificate(caminho)
-            firebase_admin.initialize_app(cred)
-            db = firestore.client()
-            print(f"🔥 Firebase conectado via: {caminho}")
-            break
-        except: pass
+  const validKeys = keys.split('\n').map(k => k.trim()).filter(k => k.length === 44)
+  const total = validKeys.length
+  const custoTotal = total * PRECO_XML
 
-# ==========================================
-# CONFIGURAÇÕES DA APLICAÇÃO
-# ==========================================
-API_KEY_MEU_DANFE = "36da320b-1b2d-47fa-b626-cc90dea64471"
-MP_ACCESS_TOKEN = "APP_USR-1091359635861022-031115-4083f4ba9bf7da16cf148d67c053efdb-3243990562"
-PRECO_POR_XML = 0.08  # O SEU PREÇO DE VENDA
+  // ==========================================
+  // SEGURANÇA E AUTENTICAÇÃO
+  // ==========================================
+  useEffect(() => {
+    // Escuta se o usuário logou pelo Google ou se já tinha sessão
+    const unsubscribe = onAuthStateChanged(auth, async (user) => { 
+      if (user) { 
+        setLoading(true)
+        try {
+          const res = await fetch(`${API_URL}/api/sync-user`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: user.email, nome: user.displayName })
+          })
+          const data = await res.json()
+          setSaldo(data.saldo || 0)
+        } catch(e) { console.error("Erro ao sincronizar saldo") }
+        setUsuario(user); 
+        setView('app'); 
+        setLoading(false)
+      } 
+    });
+    return () => unsubscribe();
+  }, []);
 
-sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-tarefas_download = {}
+  const fazerLoginTradicional = async () => {
+    if (!email || !senha) return alert("Preencha e-mail e senha.")
+    setLoading(true)
+    try {
+      const res = await fetch(`${API_URL}/api/login`, { 
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ email, senha }) 
+      })
+      const data = await res.json()
+      if (data.sucesso) { 
+        setUsuario({ email: email, displayName: data.nome }); 
+        setSaldo(data.saldo); 
+        setView('app'); 
+      } else { alert(data.erro) }
+    } catch(e) { alert("Erro de conexão com o servidor") }
+    setLoading(false)
+  }
 
-# ==========================================
-# GESTÃO DE USUÁRIO E SALDO
-# ==========================================
-@app.route('/api/sync-user', methods=['POST'])
-def sync_user():
-    dados = request.json
-    email = dados.get('email')
-    nome = dados.get('nome', 'Usuário')
-    if not db or not email: return jsonify({"erro": "Dados inválidos"}), 400
-    
-    user_ref = db.collection('usuarios').document(email)
-    doc = user_ref.get()
-    
-    if not doc.exists:
-        user_ref.set({'nome': nome, 'email': email, 'saldo': 0.0, 'data_criacao': datetime.datetime.now()})
-        return jsonify({"sucesso": True, "saldo": 0.0, "nome": nome})
-    
-    return jsonify({"sucesso": True, "saldo": doc.to_dict().get('saldo', 0.0), "nome": doc.to_dict().get('nome')})
+  const criarConta = async () => {
+    if (!nome || !email || !senha) return alert("Preencha todos os campos!")
+    setLoading(true)
+    try {
+      const res = await fetch(`${API_URL}/api/registrar`, { 
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ nome, email, senha }) 
+      })
+      const data = await res.json()
+      if (data.sucesso) { 
+        alert("Conta criada com sucesso! Faça o login."); 
+        setView('login'); setNome(''); setSenha('');
+      } else { alert(data.erro) }
+    } catch(e) { alert("Erro de conexão.") }
+    setLoading(false)
+  }
 
-@app.route('/api/login', methods=['POST'])
-def login():
-    dados = request.json
-    if not db: return jsonify({"erro": "DB Offline"}), 500
-    doc = db.collection('usuarios').document(dados.get('email')).get()
-    if doc.exists and doc.to_dict().get('senha') == dados.get('senha'):
-        return jsonify({"sucesso": True, "nome": doc.to_dict().get('nome'), "saldo": doc.to_dict().get('saldo', 0.0)})
-    return jsonify({"erro": "Credenciais incorretas"}), 401
+  const handleLogout = async () => {
+    await sairDaConta();
+    setUsuario(null);
+    setSaldo(0);
+    setIsAdmin(false);
+    setView('login');
+    setEmail('');
+    setSenha('');
+  }
 
-@app.route('/api/registrar', methods=['POST'])
-def registrar():
-    dados = request.json
-    if not db: return jsonify({"erro": "DB Offline"}), 500
-    user_ref = db.collection('usuarios').document(dados.get('email'))
-    if user_ref.get().exists: return jsonify({"erro": "E-mail já existe"}), 400
-    user_ref.set({'nome': dados['nome'], 'email': dados.get('email'), 'senha': dados.get('senha'), 'saldo': 0.0, 'data': datetime.datetime.now()})
-    return jsonify({"sucesso": True})
+  const acessarAdmin = async () => {
+    const s = prompt("Senha Mestre do Sistema:")
+    if (s === "123456Mat") {
+      setIsAdmin(true)
+      try {
+        const res = await fetch(`${API_URL}/api/admin/stats`)
+        setAdminStats(await res.json())
+        setView('admin')
+      } catch (e) { alert("Erro ao buscar dados do painel.") }
+    } else if (s !== null) { alert("Senha incorreta!") }
+  }
 
-# ==========================================
-# RECARGA DE CRÉDITOS (MERCADO PAGO)
-# ==========================================
-@app.route('/api/comprar-creditos', methods=['POST'])
-def comprar_creditos():
-    try:
-        dados = request.json
-        email = dados.get('email')
-        valor = float(dados.get('valor', 0))
-        if valor < 1: return jsonify({"erro": "Mínimo R$ 1,00"}), 400
+  // ==========================================
+  // OPERAÇÕES DO SISTEMA (CARTEIRA / DOWNLOAD)
+  // ==========================================
+  const iniciarDownloadComSaldo = async () => {
+    if (total === 0) return alert("Insira as chaves válidas.")
+    if (saldo < custoTotal) return setActiveTab('creditos')
 
-        res = sdk.payment().create({
-            "transaction_amount": valor,
-            "description": "Recarga de Saldo - Tax XML",
-            "payment_method_id": "pix",
-            "payer": {"email": email}
-        })["response"]
+    setLoading(true)
+    try {
+      const res = await fetch(`${API_URL}/api/iniciar-download`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: usuario.email, chaves: validKeys })
+      });
+      const data = await res.json();
+      if (res.status === 402) { setActiveTab('creditos'); setLoading(false); return; }
+      
+      setSaldo(data.novo_saldo)
+      setProgress({ ativo: true, processados: 0, total: total, concluido: false, taskId: data.task_id })
+      setKeys('')
+      
+      const checkInterval = setInterval(async () => {
+        const resProg = await fetch(`${API_URL}/api/progresso/${data.task_id}`);
+        const dataProg = await resProg.json();
+        setProgress(p => ({ ...p, processados: dataProg.processados }));
+        if (dataProg.concluido) { clearInterval(checkInterval); setProgress(p => ({ ...p, concluido: true })); }
+      }, 2000); 
+
+    } catch(e) { alert("Erro ao conectar com servidor.") }
+    setLoading(false)
+  }
+
+  const gerarPixCredito = async (valor) => {
+    if (valor < 1) return alert("Valor mínimo R$ 1,00")
+    setLoading(true); setQrBase64(''); setPayId(null);
+    try {
+      const res = await fetch(`${API_URL}/api/comprar-creditos`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: usuario.email, valor: parseFloat(valor) })
+      })
+      const data = await res.json()
+      if (data.qr_code_base64) { setQrBase64(data.qr_code_base64); setPayId(data.payment_id); }
+    } catch(e) { alert("Erro ao gerar PIX") }
+    setLoading(false)
+  }
+
+  const verificarPixCredito = async () => {
+    setLoading(true)
+    try {
+      const res = await fetch(`${API_URL}/api/verificar-pagamento/${payId}`)
+      const data = await res.json()
+      if (data.pago) {
+        setSaldo(data.novo_saldo); setQrBase64(''); alert("Créditos adicionados com sucesso!"); setActiveTab('download');
+      } else { alert("Pagamento ainda não aprovado. Aguarde e tente novamente.") }
+    } catch(e) {}
+    setLoading(false)
+  }
+
+  // ==========================================
+  // RENDER: TELAS DO SISTEMA
+  // ==========================================
+  
+  // TELA DE LOGIN
+  if (view === 'login') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 font-sans p-6">
+        <div className="bg-white p-10 rounded-3xl shadow-xl border border-slate-100 w-full max-w-md text-center">
+          <img src="https://i.ibb.co/7x0Qyqr8/taxxml-logo.jpg" alt="Tax XML" className="w-48 mx-auto mb-8" />
+          <h2 className="text-xl font-black text-slate-800 mb-6">Acesso ao Sistema</h2>
+          
+          <input type="email" placeholder="Seu E-mail" value={email} onChange={e=>setEmail(e.target.value)} className="w-full p-4 mb-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-sky-500 text-slate-700" />
+          <input type="password" placeholder="Sua Senha" value={senha} onChange={e=>setSenha(e.target.value)} className="w-full p-4 mb-6 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-sky-500 text-slate-700" />
+          
+          <button onClick={fazerLoginTradicional} disabled={loading} className="w-full py-4 bg-slate-800 hover:bg-slate-900 text-white font-bold rounded-xl mb-4 transition-all shadow-md flex justify-center">
+            {loading ? <Loader2 className="animate-spin" /> : "Entrar"}
+          </button>
+          
+          <div className="flex items-center justify-center gap-2 mb-4">
+             <div className="h-px w-full bg-slate-200"></div><span className="text-sm text-slate-400 font-bold">ou</span><div className="h-px w-full bg-slate-200"></div>
+          </div>
+          <button onClick={loginComGoogle} disabled={loading} className="w-full py-4 bg-white border-2 border-slate-200 text-slate-700 font-bold rounded-xl flex justify-center items-center gap-3 hover:bg-slate-50 transition-all shadow-sm">
+            <img src="https://img.icons8.com/color/24/google-logo.png" /> Entrar com Google
+          </button>
+
+          {/* BOTÕES RESTAURADOS: CRIAR CONTA E ADMIN */}
+          <div className="flex justify-between items-center mt-8 pt-4 border-t border-slate-100">
+            <button onClick={() => setView('register')} className="text-sm font-bold text-sky-600 hover:text-sky-700">Criar uma Conta</button>
+            <button onClick={acessarAdmin} className="text-slate-300 hover:text-red-500 transition-all" title="Painel Admin"><ShieldCheck size={20}/></button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // TELA DE REGISTRO (RESTAURADA)
+  if (view === 'register') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 font-sans p-6">
+        <div className="bg-white p-10 rounded-3xl shadow-xl border border-slate-100 w-full max-w-md text-center">
+          <img src="https://i.ibb.co/7x0Qyqr8/taxxml-logo.jpg" alt="Tax XML" className="w-40 mx-auto mb-6" />
+          <h2 className="text-xl font-black text-slate-800 mb-2">Nova Conta</h2>
+          <p className="text-slate-500 text-sm mb-6">Crie sua carteira digital para baixar XMLs.</p>
+          
+          <input type="text" placeholder="Seu Nome" value={nome} onChange={e=>setNome(e.target.value)} className="w-full p-4 mb-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-sky-500 text-slate-700" />
+          <input type="email" placeholder="Seu E-mail" value={email} onChange={e=>setEmail(e.target.value)} className="w-full p-4 mb-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-sky-500 text-slate-700" />
+          <input type="password" placeholder="Crie uma Senha" value={senha} onChange={e=>setSenha(e.target.value)} className="w-full p-4 mb-6 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-sky-500 text-slate-700" />
+          
+          <button onClick={criarConta} disabled={loading} className="w-full py-4 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-xl mb-4 transition-all shadow-md flex justify-center items-center gap-2">
+            {loading ? <Loader2 className="animate-spin" /> : <><UserPlus size={18}/> Finalizar Cadastro</>}
+          </button>
+          
+          <button onClick={() => setView('login')} className="text-sm font-bold text-slate-500 hover:text-slate-800">Voltar para o Login</button>
+        </div>
+      </div>
+    )
+  }
+
+  // TELA ADMIN (RESTAURADA)
+  if (view === 'admin') {
+    return (
+      <div className="min-h-screen bg-[#0f172a] text-slate-300 p-8 font-sans">
+        <div className="max-w-5xl mx-auto">
+          <div className="flex justify-between items-center mb-10">
+             <h1 className="text-3xl font-black text-white flex items-center gap-3"><ShieldCheck className="text-sky-500"/> Painel Administrativo</h1>
+             <button onClick={handleLogout} className="bg-slate-800 px-6 py-2 rounded-xl font-bold flex items-center gap-2 hover:bg-red-500/20 hover:text-red-500 transition-all"><LogOut size={16}/> Sair do Admin</button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="bg-[#1e293b] p-8 rounded-3xl border border-slate-800 shadow-2xl">
+               <Users className="text-sky-500 mb-4" size={32}/>
+               <div className="text-sm font-bold text-slate-400 uppercase">Clientes Cadastrados</div>
+               <div className="text-4xl font-black text-white">{adminStats.clientes}</div>
+            </div>
+            {/* O Backend simplificado atual só manda clientes. Os outros dados ficarão para o update futuro */}
+            <div className="bg-[#1e293b] p-8 rounded-3xl border border-slate-800 shadow-2xl opacity-50">
+               <DollarSign className="text-emerald-500 mb-4" size={32}/>
+               <div className="text-sm font-bold text-slate-400 uppercase">Em breve</div>
+               <div className="text-xl font-bold text-slate-500">Módulo Financeiro</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // TELA DO APLICATIVO (CLIENTE LOGADO)
+  if (view === 'app') {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
         
-        if db:
-            db.collection('pagamentos_pendentes').document(str(res["id"])).set({
-                'email': email, 'valor': valor, 'status': 'pendente', 'data': datetime.datetime.now()
-            })
-        return jsonify({"qr_code_base64": res["point_of_interaction"]["transaction_data"]["qr_code_base64"], "payment_id": res["id"]})
-    except Exception as e: return jsonify({"erro": str(e)}), 400
+        {/* CABEÇALHO */}
+        <header className="bg-white border-b border-slate-200 px-4 md:px-8 py-4 flex flex-wrap justify-between items-center sticky top-0 z-50 shadow-sm">
+          <div className="flex items-center gap-6">
+            <img src="https://i.ibb.co/7x0Qyqr8/taxxml-logo.jpg" className="w-24 md:w-32 object-contain" alt="Logo" />
+            <nav className="hidden lg:flex gap-6 mt-2">
+              <button onClick={() => setActiveTab('download')} className={`flex items-center gap-2 text-sm font-bold pb-5 -mb-5 border-b-2 transition-all ${activeTab==='download' ? 'border-sky-500 text-sky-600' : 'border-transparent text-slate-500 hover:text-slate-800'}`}><Download size={18}/> Download Lote</button>
+              <button onClick={() => setActiveTab('creditos')} className={`flex items-center gap-2 text-sm font-bold pb-5 -mb-5 border-b-2 transition-all ${activeTab==='creditos' ? 'border-sky-500 text-sky-600' : 'border-transparent text-slate-500 hover:text-slate-800'}`}><Wallet size={18}/> Recarregar Créditos</button>
+              <button onClick={() => setActiveTab('operacoes')} className={`flex items-center gap-2 text-sm font-bold pb-5 -mb-5 border-b-2 transition-all ${activeTab==='operacoes' ? 'border-sky-500 text-sky-600' : 'border-transparent text-slate-500 hover:text-slate-800'}`}><Clock size={18}/> Histórico</button>
+            </nav>
+          </div>
+          
+          <div className="flex items-center gap-4">
+            <button onClick={() => setActiveTab('creditos')} className="bg-sky-50 hover:bg-sky-100 border border-sky-200 px-4 py-2 rounded-xl text-sm font-black flex items-center gap-2 text-sky-700 transition-all shadow-sm">
+              <Wallet size={16}/> Saldo: R$ {saldo.toFixed(2)}
+            </button>
+            <div className="hidden md:flex items-center gap-3 text-sm font-bold text-slate-600 border-l border-slate-200 pl-4">
+              <User size={16} className="text-slate-400"/> {usuario?.displayName || usuario?.email.split('@')[0]}
+            </div>
+            <button onClick={handleLogout} className="text-red-500 hover:bg-red-50 p-2 rounded-lg transition-all" title="Sair do Sistema"><LogOut size={18}/></button>
+          </div>
+        </header>
 
-@app.route('/api/verificar-pagamento/<int:pay_id>', methods=['GET'])
-def verificar_pagamento(pay_id):
-    try:
-        res = sdk.payment().get(pay_id)["response"]
-        if res.get("status") == "approved":
-            doc_ref = db.collection('pagamentos_pendentes').document(str(pay_id))
-            doc = doc_ref.get()
-            if doc.exists and doc.to_dict().get('status') == 'pendente':
-                dados = doc.to_dict()
-                user_ref = db.collection('usuarios').document(dados['email'])
-                saldo_atual = user_ref.get().to_dict().get('saldo', 0.0)
-                user_ref.update({'saldo': saldo_atual + dados['valor']})
-                doc_ref.update({'status': 'concluido'})
-                return jsonify({"pago": True, "novo_saldo": saldo_atual + dados['valor']})
-            return jsonify({"pago": True, "mensagem": "Já processado"})
-        return jsonify({"pago": False})
-    except Exception as e: return jsonify({"erro": str(e)}), 500
+        {/* NAVEGAÇÃO MOBILE */}
+        <div className="lg:hidden flex overflow-x-auto bg-white border-b border-slate-200 p-2 gap-2">
+           <button onClick={() => setActiveTab('download')} className={`flex-1 min-w-[120px] py-2 text-xs font-bold rounded-lg ${activeTab==='download' ? 'bg-sky-100 text-sky-700' : 'text-slate-500'}`}>Download</button>
+           <button onClick={() => setActiveTab('creditos')} className={`flex-1 min-w-[120px] py-2 text-xs font-bold rounded-lg ${activeTab==='creditos' ? 'bg-sky-100 text-sky-700' : 'text-slate-500'}`}>Créditos</button>
+           <button onClick={() => setActiveTab('operacoes')} className={`flex-1 min-w-[120px] py-2 text-xs font-bold rounded-lg ${activeTab==='operacoes' ? 'bg-sky-100 text-sky-700' : 'text-slate-500'}`}>Histórico</button>
+        </div>
 
-# ==========================================
-# DOWNLOAD COM DÉBITO NO SALDO
-# ==========================================
-@app.route('/api/iniciar-download', methods=['POST'])
-def iniciar_download():
-    dados = request.json
-    email = dados.get('email')
-    chaves = dados.get('chaves', [])
-    if not chaves or not email: return jsonify({"erro": "Dados incompletos"}), 400
-    
-    custo_total = len(chaves) * PRECO_POR_XML
-    user_ref = db.collection('usuarios').document(email)
-    saldo_atual = user_ref.get().to_dict().get('saldo', 0.0)
-    
-    if saldo_atual < custo_total:
-        return jsonify({"erro": "Saldo insuficiente"}), 402
-    
-    # Desconta o saldo
-    novo_saldo = saldo_atual - custo_total
-    user_ref.update({'saldo': novo_saldo})
-    
-    task_id = str(uuid.uuid4())
-    tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False, 'zip_bytes': None}
-    threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
-    
-    return jsonify({"task_id": task_id, "novo_saldo": novo_saldo})
+        <main className="max-w-6xl mx-auto p-4 md:p-8">
+          
+          {/* ABA: DOWNLOAD EM LOTE */}
+          {activeTab === 'download' && (
+            <div className="animate-in fade-in duration-300">
+              <div className="mb-6">
+                <h2 className="text-2xl font-black text-slate-800 mb-1">Download em Lote</h2>
+                <p className="text-slate-500">Cole as chaves. O valor será descontado da sua carteira digital.</p>
+              </div>
+              
+              <div className="grid lg:grid-cols-3 gap-6">
+                <div className="lg:col-span-2 bg-white p-6 md:p-8 rounded-3xl border border-slate-200 shadow-sm">
+                  <div className="flex items-center gap-2 mb-4 font-bold text-slate-700"><FileText size={18} className="text-sky-500"/> Chaves de Acesso (44 dígitos)</div>
+                  <textarea 
+                    className="w-full h-80 bg-slate-50 border border-slate-200 rounded-2xl p-4 text-sm font-mono text-slate-600 focus:outline-none focus:border-sky-500 focus:ring-4 focus:ring-sky-50 transition-all resize-none"
+                    placeholder="Cole as chaves aqui..."
+                    value={keys} onChange={e => setKeys(e.target.value)} disabled={progress.ativo}
+                  />
+                  <div className="mt-3 flex justify-between text-sm font-bold text-slate-500">
+                    <span>{total} chaves identificadas</span>
+                  </div>
+                </div>
 
-# ==========================================
-# MOTOR DE DOWNLOAD (THREADS)
-# ==========================================
-def baixar_xml_original(session, chave):
-    h = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
-    try:
-        r = session.get(f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}", headers=h, timeout=12)
-        c = r.text.strip()
-        xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
-        if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
-        session.put(f"https://api.meudanfe.com.br/v2/fd/add/{chave}", headers=h, timeout=12)
-        time.sleep(5)
-        r = session.get(f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}", headers=h, timeout=12)
-        c = r.text.strip()
-        xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
-        if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
-    except: pass
-    return False, chave, None
+                <div className="bg-white p-6 md:p-8 rounded-3xl border border-slate-200 shadow-sm h-fit">
+                  <h3 className="font-bold text-slate-800 mb-6 uppercase tracking-wider text-sm">Resumo da Operação</h3>
+                  <div className="space-y-4 text-sm text-slate-600 border-b border-slate-100 pb-6 mb-6">
+                    <div className="flex justify-between"><span>Chaves Válidas</span><span className="font-black text-slate-800">{total}</span></div>
+                    <div className="flex justify-between"><span>Custo por Chave</span><span>R$ {PRECO_XML.toFixed(2)}</span></div>
+                    <div className="flex justify-between pt-2"><span>Custo Total</span><span className="text-2xl text-sky-600 font-black">R$ {custoTotal.toFixed(2)}</span></div>
+                  </div>
+                  
+                  {progress.ativo ? (
+                    <div className="text-center bg-sky-50 p-6 rounded-2xl border border-sky-100">
+                      <Loader2 className="animate-spin text-sky-500 mx-auto mb-3" size={32}/>
+                      <p className="text-sm font-black text-sky-700">{progress.processados} / {progress.total} XMLs</p>
+                      <p className="text-xs text-sky-600 mt-1">Buscando na Sefaz...</p>
+                      {progress.concluido && (
+                         <a href={`${API_URL}/api/baixar-zip/${progress.taskId}`} onClick={() => setProgress({ativo: false, processados: 0, total: 0, concluido: false})} className="mt-4 block w-full bg-emerald-500 hover:bg-emerald-600 text-white font-black py-4 rounded-xl shadow-lg transition-all text-center">
+                           Salvar Arquivo ZIP
+                         </a>
+                      )}
+                    </div>
+                  ) : (
+                    <button 
+                      onClick={iniciarDownloadComSaldo} disabled={loading}
+                      className={`w-full py-4 rounded-2xl font-black text-lg shadow-md transition-all flex justify-center items-center gap-2 ${saldo < custoTotal && total > 0 ? 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100' : 'bg-sky-500 hover:bg-sky-600 text-white'}`}
+                    >
+                      {loading ? <Loader2 className="animate-spin"/> : saldo < custoTotal && total > 0 ? 'Saldo Insuficiente' : 'Processar Lote'}
+                    </button>
+                  )}
+                  {saldo < custoTotal && total > 0 && (
+                     <button onClick={() => setActiveTab('creditos')} className="w-full mt-3 text-sm font-bold text-sky-600 hover:underline">Ir para Recarga</button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
-def processar_lote_bg(task_id, chaves):
-    zip_buf = io.BytesIO()
-    sucessos = 0
-    with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
-        with requests.Session() as sess:
-            with ThreadPoolExecutor(max_workers=15) as exe:
-                futures = {exe.submit(baixar_xml_original, sess, c): c for c in chaves}
-                for i, j in enumerate(as_completed(futures)):
-                    ok, ch, xml_data = j.result()
-                    if ok: zf.writestr(f"{ch}.xml", xml_data); sucessos += 1
-                    tarefas_download[task_id]['processados'] = i + 1
-    tarefas_download[task_id]['sucessos'] = sucessos
-    tarefas_download[task_id]['concluido'] = True
-    tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
+          {/* ABA: CRÉDITOS */}
+          {activeTab === 'creditos' && (
+            <div className="animate-in fade-in duration-300">
+              <div className="mb-6">
+                <h2 className="text-2xl font-black text-slate-800 mb-1">Carteira Digital</h2>
+                <p className="text-slate-500">Adicione saldo via PIX. A liberação na conta é imediata.</p>
+              </div>
+              
+              <div className="grid lg:grid-cols-3 gap-6">
+                <div className="lg:col-span-2 space-y-6">
+                  
+                  {/* Card de Saldo */}
+                  <div className="bg-slate-800 p-8 rounded-3xl shadow-xl flex items-center gap-6 text-white relative overflow-hidden">
+                    <div className="w-16 h-16 bg-white/10 rounded-2xl flex items-center justify-center"><Wallet size={32} className="text-sky-400"/></div>
+                    <div className="z-10">
+                      <p className="text-sm text-slate-300 font-bold uppercase tracking-wider mb-1">Saldo Atual Disponível</p>
+                      <h3 className="text-5xl font-black text-white">R$ {saldo.toFixed(2)}</h3>
+                      <p className="text-sm text-emerald-400 mt-2 font-bold flex items-center gap-1"><CheckCircle size={14}/> Suficiente para {Math.floor(saldo / PRECO_XML)} downloads</p>
+                    </div>
+                  </div>
 
-@app.route('/api/progresso/<task_id>', methods=['GET'])
-def ver_progresso(task_id):
-    tarefa = tarefas_download.get(task_id)
-    return jsonify(tarefa) if tarefa else ({"erro": "404"}, 404)
+                  {/* Card de Compra */}
+                  <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
+                    <h3 className="font-black text-slate-800 mb-6 flex items-center gap-2"><PlusCircle className="text-sky-500"/> Pacotes de Recarga</h3>
+                    
+                    {!qrBase64 ? (
+                      <>
+                        <div className="grid grid-cols-2 gap-4 mb-6">
+                          {[20, 50, 100, 200].map(val => (
+                            <button key={val} onClick={() => gerarPixCredito(val)} className="p-5 bg-slate-50 border border-slate-200 hover:border-sky-500 rounded-2xl text-left transition-all">
+                              <div className="text-2xl font-black text-slate-700">R$ {val},00</div>
+                              <div className="text-sm font-bold text-slate-400 mt-1">{val / PRECO_XML} XMLs</div>
+                            </button>
+                          ))}
+                        </div>
+                        <div className="flex gap-3">
+                          <input type="number" placeholder="Outro valor (R$)" value={valorCustom} onChange={e=>setValorCustom(e.target.value)} className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl p-4 text-slate-700 outline-none focus:border-sky-500 font-bold"/>
+                          <button onClick={() => gerarPixCredito(valorCustom)} disabled={loading} className="bg-slate-800 hover:bg-slate-900 text-white font-black px-8 rounded-2xl flex items-center justify-center">
+                            {loading ? <Loader2 className="animate-spin" /> : "Gerar PIX"}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="text-center bg-emerald-50 p-8 rounded-3xl border-2 border-dashed border-emerald-200">
+                        <h4 className="font-black text-emerald-800 mb-4">Escaneie o QR Code</h4>
+                        <img src={`data:image/png;base64,${qrBase64}`} className="mx-auto w-48 rounded-xl shadow-md mb-6 bg-white p-2" />
+                        <button onClick={verificarPixCredito} className="bg-emerald-500 hover:bg-emerald-600 text-white font-black py-4 px-8 rounded-2xl transition-all shadow-lg w-full flex justify-center items-center gap-2">
+                          {loading ? <Loader2 className="animate-spin"/> : <><QrCode/> Já realizei o pagamento</>}
+                        </button>
+                        <button onClick={() => setQrBase64('')} className="block w-full text-slate-500 hover:text-slate-700 text-sm font-bold mt-4">Cancelar operação</button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
-@app.route('/api/baixar-zip/<task_id>', methods=['GET'])
-def baixar_zip(task_id):
-    tarefa = tarefas_download.get(task_id)
-    return send_file(io.BytesIO(tarefa['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
+          {/* ABA: OPERAÇÕES */}
+          {activeTab === 'operacoes' && (
+            <div className="animate-in fade-in duration-300">
+              <div className="mb-8">
+                <h2 className="text-2xl font-black text-slate-800 mb-1">Minhas Operações</h2>
+                <p className="text-slate-500">Histórico detalhado em breve.</p>
+              </div>
+              <div className="bg-white p-16 rounded-3xl border border-slate-200 text-center shadow-sm">
+                 <h3 className="text-slate-700 font-black text-lg mb-2">Sem histórico</h3>
+                 <p className="text-slate-500 mb-6">Você ainda não baixou nenhum lote.</p>
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+    )
+  }
 
-# ADMIN STATS SIMPLIFICADO
-@app.route('/api/admin/stats', methods=['GET'])
-def admin_stats():
-    if not db: return jsonify({"clientes": 0})
-    return jsonify({"clientes": sum(1 for _ in db.collection('usuarios').stream())})
+  return null
+}
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+export default App
