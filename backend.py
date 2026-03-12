@@ -20,23 +20,34 @@ from firebase_admin import credentials, firestore
 app = Flask(__name__)
 CORS(app)
 
-# Tenta encontrar a chave no caminho do Render ou na pasta local do seu PC
-caminho_chave = "/etc/secrets/firebase-key.json"
+# Lista de caminhos onde a chave pode estar (Render e PC)
+caminhos_possiveis = [
+    "/etc/secrets/firebase-key.json",  # Caminho padrão do Render
+    "/etc/secrets/key.json",           # Alternativo caso mude no painel
+    "firebase-key.json",               # Raiz do projeto (PC)
+    "key.json"                         # Raiz do projeto (PC alternativo)
+]
 
-try:
-    # Se não existir no caminho do Render, tenta na pasta atual (seu PC)
-    if not os.path.exists(caminho_chave):
-        caminho_chave = "firebase-key.json"
+db = None
+chave_encontrada = None
 
-    cred = credentials.Certificate(caminho_chave)
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print(f"🔥 Firebase conectado com sucesso usando: {caminho_chave}")
-except Exception as e:
-    print(f"⚠️ Erro Crítico: Arquivo de chave não encontrado. Erro: {e}")
+for caminho in caminhos_possiveis:
+    if os.path.exists(caminho):
+        try:
+            cred = credentials.Certificate(caminho)
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            chave_encontrada = caminho
+            print(f"🔥 Firebase conectado com sucesso usando: {caminho}")
+            break
+        except Exception as e:
+            print(f"Tentativa falhou em {caminho}: {e}")
+
+if db is None:
+    print("⚠️ ERRO CRÍTICO: Nenhuma chave Firebase encontrada nos caminhos verificados.")
 
 # ==========================================
-# CONFIGURAÇÕES E CHAVES ORIGINAIS
+# CONFIGURAÇÕES E CHAVES
 # ==========================================
 API_KEY_MEU_DANFE = "36da320b-1b2d-47fa-b626-cc90dea64471"
 MP_ACCESS_TOKEN = "APP_USR-1091359635861022-031115-4083f4ba9bf7da16cf148d67c053efdb-3243990562"
@@ -46,19 +57,20 @@ sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 tarefas_download = {}
 
 # ==========================================
-# FUNÇÕES DE BANCO DE DADOS (FIRESTORE)
+# FUNÇÕES DE BANCO DE DADOS
 # ==========================================
 def salvar_venda(qtd, valor, metodo, email_cliente):
-    try:
-        db.collection('vendas').add({
-            'quantidade_xml': qtd,
-            'valor_total': valor,
-            'metodo': metodo,
-            'email': email_cliente,
-            'data_compra': datetime.datetime.now()
-        })
-    except Exception as e:
-        print(f"Erro ao gravar venda: {e}")
+    if db:
+        try:
+            db.collection('vendas').add({
+                'quantidade_xml': qtd,
+                'valor_total': valor,
+                'metodo': metodo,
+                'email': email_cliente,
+                'data_compra': datetime.datetime.now()
+            })
+        except Exception as e:
+            print(f"Erro ao gravar venda: {e}")
 
 # ==========================================
 # ROTAS DE USUÁRIO E ADMIN
@@ -66,12 +78,12 @@ def salvar_venda(qtd, valor, metodo, email_cliente):
 @app.route('/api/registrar', methods=['POST'])
 def registrar_usuario():
     dados = request.json
+    if not db: return jsonify({"erro": "Banco de dados offline"}), 500
     try:
         users_ref = db.collection('usuarios')
         docs = users_ref.where('email', '==', dados['email']).stream()
         if len(list(docs)) > 0:
             return jsonify({"erro": "E-mail já cadastrado!"}), 400
-            
         users_ref.add({
             'nome': dados['nome'],
             'email': dados['email'],
@@ -84,6 +96,7 @@ def registrar_usuario():
 @app.route('/api/login', methods=['POST'])
 def fazer_login():
     dados = request.json
+    if not db: return jsonify({"erro": "Banco de dados offline"}), 500
     try:
         docs = db.collection('usuarios').where('email', '==', dados['email']).where('senha', '==', dados['senha']).stream()
         for doc in docs:
@@ -94,6 +107,7 @@ def fazer_login():
 
 @app.route('/api/admin/stats', methods=['GET'])
 def get_stats():
+    if not db: return jsonify({"total_xmls": 0, "faturamento": 0, "clientes_ativos": 0})
     try:
         vendas_docs = db.collection('vendas').stream()
         total_xmls = 0
@@ -102,7 +116,6 @@ def get_stats():
             d = venda.to_dict()
             total_xmls += d.get('quantidade_xml', 0)
             faturamento += d.get('valor_total', 0.0)
-            
         clientes = sum(1 for _ in db.collection('usuarios').stream())
         return jsonify({"total_xmls": total_xmls, "faturamento": faturamento, "clientes_ativos": clientes})
     except:
@@ -118,20 +131,14 @@ def gerar_pix():
         qtd = dados.get('quantidade', 0)
         email = dados.get('email', 'desconhecido')
         valor = float(qtd * PRECO_POR_XML)
-        
         salvar_venda(qtd, valor, "PIX", email)
-        
         res = sdk.payment().create({
             "transaction_amount": valor,
             "description": f"Tax XML - {qtd} notas",
             "payment_method_id": "pix",
             "payer": {"email": email if "@" in email else "cliente@taxxml.com"}
         })["response"]
-        
-        return jsonify({
-            "qr_code_base64": res["point_of_interaction"]["transaction_data"]["qr_code_base64"],
-            "payment_id": res["id"]
-        })
+        return jsonify({"qr_code_base64": res["point_of_interaction"]["transaction_data"]["qr_code_base64"], "payment_id": res["id"]})
     except Exception as e: return jsonify({"erro": str(e)}), 400
 
 @app.route('/api/pagar-cartao', methods=['POST'])
@@ -141,17 +148,14 @@ def gerar_cartao():
         qtd = dados.get('quantidade', 0)
         email = dados.get('email', 'desconhecido')
         valor = float(qtd * PRECO_POR_XML)
-        
         salvar_venda(qtd, valor, "CARTAO", email)
         rastreio = str(uuid.uuid4())
-        
         res = sdk.preference().create({
             "items": [{"title": f"Tax XML - {qtd} notas", "quantity": 1, "unit_price": valor, "currency_id": "BRL"}],
             "external_reference": rastreio,
             "back_urls": {"success": "https://taxxml.com.br", "failure": "https://taxxml.com.br", "pending": "https://taxxml.com.br"},
             "auto_return": "approved"
         })["response"]
-        
         return jsonify({"checkout_url": res["init_point"], "rastreio": rastreio})
     except Exception as e: return jsonify({"erro": str(e)}), 400
 
@@ -178,10 +182,8 @@ def baixar_xml_original(session, chave):
         c = r.text.strip()
         xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
         if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
-        
         session.put(url_add, headers=headers, timeout=12)
         time.sleep(5)
-        
         r = session.get(url_get, headers=headers, timeout=12)
         c = r.text.strip()
         xml = r.json().get('data') or r.json().get('xml') if c.startswith('{') else c if c.startswith('<') else None
@@ -228,6 +230,5 @@ def baixar_zip(task_id):
     return send_file(io.BytesIO(tarefa['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
 
 if __name__ == '__main__':
-    # No PC roda na porta 5000, no Render ele usa a variável de ambiente PORT
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
