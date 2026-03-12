@@ -6,12 +6,30 @@ import time
 import zipfile
 import io
 import uuid
-import sqlite3
 import threading
+import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ==========================================
+# NOVO: IMPORTANDO O FIREBASE (BANDO DE DADOS CLOUD)
+# ==========================================
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 app = Flask(__name__)
 CORS(app)
+
+# ==========================================
+# INICIALIZANDO O FIREBASE
+# ==========================================
+# O Python vai procurar o arquivo 'firebase-key.json' na mesma pasta
+try:
+    cred = credentials.Certificate("firebase-key.json")
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    print("🔥 Firebase Cloud Firestore conectado com sucesso!")
+except Exception as e:
+    print(f"⚠️ Erro Crítico ao conectar no Firebase. O arquivo 'firebase-key.json' está na pasta? Erro: {e}")
 
 # ==========================================
 # CONFIGURAÇÕES E CHAVES
@@ -24,70 +42,89 @@ sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 tarefas_download = {}
 
 # ==========================================
-# BANCO DE DADOS (SQLite)
+# FUNÇÃO PARA SALVAR A VENDA NA NUVEM
 # ==========================================
-def conectar_banco():
-    conn = sqlite3.connect('banco_taxxml.db')
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def iniciar_banco():
-    conn = conectar_banco()
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, email TEXT UNIQUE NOT NULL, senha TEXT NOT NULL)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS vendas (id INTEGER PRIMARY KEY AUTOINCREMENT, quantidade_xml INTEGER, valor_total REAL, metodo TEXT)''')
-    cursor.execute("SELECT COUNT(*) FROM usuarios")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO usuarios (nome, email, senha) VALUES ('Moraes Admin', 'admin@moraes.com', 'admin123')")
-    conn.commit()
-    conn.close()
-
-iniciar_banco()
-
-def salvar_venda(qtd, valor, metodo):
-    conn = conectar_banco()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO vendas (quantidade_xml, valor_total, metodo) VALUES (?, ?, ?)", (qtd, valor, metodo))
-    conn.commit()
-    conn.close()
+def salvar_venda(qtd, valor, metodo, email_cliente):
+    try:
+        db.collection('vendas').add({
+            'quantidade_xml': qtd,
+            'valor_total': valor,
+            'metodo': metodo,
+            'email': email_cliente,
+            'data_compra': datetime.datetime.now()
+        })
+    except Exception as e:
+        print(f"Erro ao gravar venda no Firestore: {e}")
 
 # ==========================================
-# ROTAS DE USUÁRIO E ADMIN
+# ROTAS DE USUÁRIO (AGORA NO FIREBASE)
 # ==========================================
 @app.route('/api/registrar', methods=['POST'])
 def registrar_usuario():
     dados = request.json
     try:
-        conn = conectar_banco()
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO usuarios (nome, email, senha) VALUES (?, ?, ?)", (dados['nome'], dados['email'], dados['senha']))
-        conn.commit()
-        conn.close()
-        return jsonify({"sucesso": True, "mensagem": "Conta criada!"})
-    except sqlite3.IntegrityError: return jsonify({"erro": "E-mail cadastrado!"}), 400
-    except Exception as e: return jsonify({"erro": str(e)}), 500
+        users_ref = db.collection('usuarios')
+        
+        # Verifica se o e-mail já existe
+        docs = users_ref.where('email', '==', dados['email']).stream()
+        if len(list(docs)) > 0:
+            return jsonify({"erro": "Este e-mail já está cadastrado!"}), 400
+            
+        # Grava o novo usuário na nuvem
+        users_ref.add({
+            'nome': dados['nome'],
+            'email': dados['email'],
+            'senha': dados['senha'],
+            'data_criacao': datetime.datetime.now()
+        })
+        return jsonify({"sucesso": True, "mensagem": "Conta criada com sucesso!"})
+    except Exception as e: 
+        return jsonify({"erro": str(e)}), 500
 
 @app.route('/api/login', methods=['POST'])
 def fazer_login():
     dados = request.json
-    conn = conectar_banco()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM usuarios WHERE email = ? AND senha = ?", (dados['email'], dados['senha']))
-    usuario = cursor.fetchone()
-    conn.close()
-    if usuario: return jsonify({"sucesso": True, "nome": usuario['nome']})
-    return jsonify({"erro": "E-mail ou senha incorretos."}), 401
+    try:
+        users_ref = db.collection('usuarios')
+        # Procura o usuário no Firebase
+        docs = users_ref.where('email', '==', dados['email']).where('senha', '==', dados['senha']).stream()
+        
+        for doc in docs:
+            usuario = doc.to_dict()
+            return jsonify({"sucesso": True, "nome": usuario.get('nome')})
+            
+        return jsonify({"erro": "E-mail ou senha incorretos."}), 401
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
+# ==========================================
+# A SUA DASHBOARD: BUSCANDO OS DADOS REAIS
+# ==========================================
 @app.route('/api/admin/stats', methods=['GET'])
 def get_stats():
-    conn = conectar_banco()
-    cursor = conn.cursor()
-    cursor.execute("SELECT SUM(quantidade_xml), SUM(valor_total) FROM vendas")
-    vendas = cursor.fetchone()
-    cursor.execute("SELECT COUNT(*) FROM usuarios")
-    clientes = cursor.fetchone()[0]
-    conn.close()
-    return jsonify({"total_xmls": vendas[0] or 0, "faturamento": vendas[1] or 0.0, "clientes_ativos": clientes})
+    try:
+        # Busca todas as vendas no Firebase
+        vendas_docs = db.collection('vendas').stream()
+        total_xmls = 0
+        faturamento = 0.0
+        
+        for venda in vendas_docs:
+            dados = venda.to_dict()
+            total_xmls += dados.get('quantidade_xml', 0)
+            faturamento += dados.get('valor_total', 0.0)
+            
+        # Conta quantos clientes existem
+        clientes_ativos = sum(1 for _ in db.collection('usuarios').stream())
+        
+        return jsonify({
+            "total_xmls": total_xmls, 
+            "faturamento": faturamento, 
+            "clientes_ativos": clientes_ativos
+        })
+    except Exception as e:
+        print(f"Erro ao buscar stats: {e}")
+        # Retorna zerado em caso de erro para não quebrar a tela
+        return jsonify({"total_xmls": 0, "faturamento": 0.0, "clientes_ativos": 0})
 
 # ==========================================
 # ROTAS DE PAGAMENTO E CHECKOUT
@@ -96,8 +133,12 @@ def get_stats():
 def gerar_pix():
     try:
         qtd = request.json.get('quantidade', 0)
+        email_cliente = request.json.get('email', 'desconhecido') # Pega o email que o novo Frontend envia
         valor = float(qtd * PRECO_POR_XML)
-        salvar_venda(qtd, valor, "PIX") 
+        
+        # Salva na nuvem antes de gerar o código
+        salvar_venda(qtd, valor, "PIX", email_cliente) 
+        
         res = sdk.payment().create({
             "transaction_amount": valor, 
             "description": f"Tax XML - {qtd} notas", 
@@ -114,20 +155,21 @@ def gerar_pix():
 def gerar_cartao():
     try:
         qtd = request.json.get('quantidade', 0)
+        email_cliente = request.json.get('email', 'desconhecido')
         valor = float(qtd * PRECO_POR_XML)
-        salvar_venda(qtd, valor, "CARTAO") 
+        
+        salvar_venda(qtd, valor, "CARTAO", email_cliente) 
         codigo_rastreio = str(uuid.uuid4())
         
-        # AQUI ESTÃO OS SEUS LINKS DA VERCEL CONFIGURADOS CORRETAMENTE
         res = sdk.preference().create({
             "items": [{"title": f"Tax XML - {qtd} notas", "quantity": 1, "unit_price": valor, "currency_id": "BRL"}], 
             "payer": {"email": "cliente@taxxml.com"}, 
             "payment_methods": {"installments": 1}, 
             "external_reference": codigo_rastreio,
             "back_urls": {
-                "success": "https://taxxml-frontend.vercel.app",
-                "failure": "https://taxxml-frontend.vercel.app",
-                "pending": "https://taxxml-frontend.vercel.app"
+                "success": "https://taxxml.com.br",
+                "failure": "https://taxxml.com.br",
+                "pending": "https://taxxml.com.br"
             },
             "auto_return": "approved"
         })["response"]
@@ -147,7 +189,7 @@ def status_cartao(rastreio):
     return jsonify({"pago": pago})
 
 # ==========================================
-# MOTOR DE DOWNLOAD (BACKGROUND TASK)
+# MOTOR DE DOWNLOAD (BACKGROUND TASK - INTACTO)
 # ==========================================
 def baixar_xml_original(session, chave):
     headers = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
