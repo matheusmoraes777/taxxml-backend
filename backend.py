@@ -2,7 +2,7 @@ import os
 import time
 import uuid
 import zipfile
-import io
+import json
 import threading
 import datetime
 import requests
@@ -38,11 +38,29 @@ PRECO_POR_XML = 0.08
 
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# A MEMÓRIA RAM QUE FUNCIONAVA NA SUA VERSÃO ANTIGA
-tarefas_download = {}
+# ==========================================
+# SISTEMA ANTI-AMNÉSIA DO RENDER (PASTA FÍSICA)
+# ==========================================
+os.makedirs("tmp_tasks", exist_ok=True)
+
+def atualizar_progresso(task_id, processados, total, concluido=False):
+    """Salva o progresso num arquivo físico, assim nenhum Trabalhador do Render perde a memória"""
+    estado = {"processados": processados, "total": total, "concluido": concluido}
+    try:
+        with open(f"tmp_tasks/{task_id}.json", "w") as f:
+            json.dump(estado, f)
+    except: pass
+
+def ler_progresso(task_id):
+    try:
+        if os.path.exists(f"tmp_tasks/{task_id}.json"):
+            with open(f"tmp_tasks/{task_id}.json", "r") as f:
+                return json.load(f)
+    except: pass
+    return {"processados": 0, "total": 1, "concluido": False} 
 
 # ==========================================
-# ROTAS DE USUÁRIO E CARTEIRA
+# ROTAS DE USUÁRIO E SALDO
 # ==========================================
 @app.route('/api/sync-user', methods=['POST'])
 def sync_user():
@@ -75,6 +93,9 @@ def registrar():
     user_ref.set({'nome': dados['nome'], 'email': dados.get('email'), 'senha': dados.get('senha'), 'saldo': 0.0, 'data': datetime.datetime.now()})
     return jsonify({"sucesso": True})
 
+# ==========================================
+# RECARGAS VIA PIX
+# ==========================================
 @app.route('/api/comprar-creditos', methods=['POST'])
 def comprar_creditos():
     try:
@@ -114,55 +135,61 @@ def verificar_pagamento(pay_id):
     except Exception: return jsonify({"erro": "erro"}), 500
 
 # ==========================================
-# MOTOR DE DOWNLOAD LIVRE DE TRAVAS
+# MOTOR DE DOWNLOAD MODO TURBO 🚀
 # ==========================================
-def baixar_xml_seguro(chave):
+def baixar_xml_veloz(chave):
     headers = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
     url_get = f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}"
     url_add = f"https://api.meudanfe.com.br/v2/fd/add/{chave}"
-    try:
-        # Requisita de forma isolada, sem usar Session (evita engarrafamento no Render)
-        r1 = requests.get(url_get, headers=headers, timeout=12)
-        c1 = r1.text.strip()
-        xml = r1.json().get('data') or r1.json().get('xml') if c1.startswith('{') else c1 if c1.startswith('<') else None
-        if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
-        
-        requests.put(url_add, headers=headers, timeout=12)
-        time.sleep(5)
-        
-        r2 = requests.get(url_get, headers=headers, timeout=12)
-        c2 = r2.text.strip()
-        xml = r2.json().get('data') or r2.json().get('xml') if c2.startswith('{') else c2 if c2.startswith('<') else None
-        if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
-    except: pass
+    
+    # Uma sessão isolada por nota deixa a comunicação HTTP mais rápida
+    with requests.Session() as sess:
+        try:
+            # 1ª Tentativa: Vê se a nota já está no cache do Meu Danfe (Baixa super rápido)
+            r1 = sess.get(url_get, headers=headers, timeout=10)
+            c1 = r1.text.strip()
+            xml = r1.json().get('data') or r1.json().get('xml') if c1.startswith('{') else c1 if c1.startswith('<') else None
+            if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
+            
+            # Se não tem no cache, manda a Sefaz processar
+            sess.put(url_add, headers=headers, timeout=10)
+            
+            # Loop agressivo: Tenta buscar a cada 1.5s (Máximo 3 tentativas)
+            for _ in range(3):
+                time.sleep(1.5)
+                r2 = sess.get(url_get, headers=headers, timeout=10)
+                c2 = r2.text.strip()
+                xml = r2.json().get('data') or r2.json().get('xml') if c2.startswith('{') else c2 if c2.startswith('<') else None
+                if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
+                
+        except: pass
     return False, chave, None
 
 def processar_lote_bg(task_id, chaves):
-    zip_buf = io.BytesIO()
-    sucessos = 0
+    total = len(chaves)
+    processados = 0
+    atualizar_progresso(task_id, processados, total, False)
+    
+    zip_path = f"tmp_tasks/{task_id}.zip"
+    
     try:
-        with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
-            with ThreadPoolExecutor(max_workers=10) as exe:
-                futures = {exe.submit(baixar_xml_seguro, c): c for c in chaves}
-                for i, j in enumerate(as_completed(futures)):
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # TURBO: 20 trabalhadores puxando notas ao mesmo tempo!
+            with ThreadPoolExecutor(max_workers=20) as exe:
+                futures = {exe.submit(baixar_xml_veloz, c): c for c in chaves}
+                for future in as_completed(futures):
                     try:
-                        ok, ch, xml_data = j.result()
+                        ok, ch, xml_data = future.result()
                         if ok and xml_data:
                             zf.writestr(f"{ch}.xml", xml_data)
-                            sucessos += 1
                     except: pass
-                    
-                    # Atualiza a memória RAM instantaneamente
-                    if task_id in tarefas_download:
-                        tarefas_download[task_id]['processados'] = i + 1
+                    processados += 1
+                    atualizar_progresso(task_id, processados, total, False)
     except Exception as e:
         print(f"Erro Crítico Geral: {e}")
     finally:
-        # Avisa que concluiu para destravar o botão
-        if task_id in tarefas_download:
-            tarefas_download[task_id]['sucessos'] = sucessos
-            tarefas_download[task_id]['concluido'] = True
-            tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
+        # Destrava o botão do cliente quando finalizado
+        atualizar_progresso(task_id, processados, total, True)
 
 @app.route('/api/iniciar-download', methods=['POST'])
 def iniciar_download():
@@ -177,11 +204,12 @@ def iniciar_download():
     
     if saldo_atual < custo_total: return jsonify({"erro": "Saldo insuficiente"}), 402
     
+    # Desconta e Inicia
     novo_saldo = saldo_atual - custo_total
     user_ref.update({'saldo': novo_saldo})
     
     task_id = str(uuid.uuid4())
-    tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False, 'zip_bytes': None}
+    atualizar_progresso(task_id, 0, len(chaves), False) # Cria o arquivo imediatamente
     
     threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
     
@@ -189,16 +217,15 @@ def iniciar_download():
 
 @app.route('/api/progresso/<task_id>', methods=['GET'])
 def ver_progresso(task_id):
-    tarefa = tarefas_download.get(task_id)
-    if tarefa: return jsonify(tarefa)
-    return jsonify({"erro": "Tarefa não encontrada"}), 404
+    estado = ler_progresso(task_id)
+    return jsonify(estado)
 
 @app.route('/api/baixar-zip/<task_id>', methods=['GET'])
 def baixar_zip(task_id):
-    tarefa = tarefas_download.get(task_id)
-    if tarefa and tarefa.get('zip_bytes'):
-        return send_file(io.BytesIO(tarefa['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
-    return jsonify({"erro": "Arquivo expirou"}), 404
+    caminho = f"tmp_tasks/{task_id}.zip"
+    if os.path.exists(caminho):
+        return send_file(caminho, mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
+    return jsonify({"erro": "Arquivo expirou ou não foi gerado"}), 404
 
 @app.route('/api/admin/stats', methods=['GET'])
 def admin_stats():
