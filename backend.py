@@ -36,9 +36,7 @@ PRECO_POR_XML = 0.08
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 tarefas_download = {}
 
-# ==========================================
-# ROTAS DE USUÁRIO E SALDO
-# ==========================================
+# ROTAS DE USUÁRIO
 @app.route('/api/sync-user', methods=['POST'])
 def sync_user():
     dados = request.json
@@ -70,6 +68,7 @@ def registrar():
     user_ref.set({'nome': dados['nome'], 'email': dados.get('email'), 'senha': dados.get('senha'), 'saldo': 0.0, 'data': datetime.datetime.now()})
     return jsonify({"sucesso": True})
 
+# RECARGAS
 @app.route('/api/comprar-creditos', methods=['POST'])
 def comprar_creditos():
     try:
@@ -109,7 +108,7 @@ def verificar_pagamento(pay_id):
     except Exception: return jsonify({"erro": "erro"}), 500
 
 # ==========================================
-# O SEU MOTOR DE DOWNLOAD ORIGINAL
+# MOTOR DE DOWNLOAD REFORÇADO
 # ==========================================
 def baixar_xml_original(session, chave):
     headers = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
@@ -122,7 +121,7 @@ def baixar_xml_original(session, chave):
         if xml and "<nfeProc" in xml: return True, chave, xml[xml.find("<"):].encode('utf-8')
         
         session.put(url_add, headers=headers, timeout=15)
-        time.sleep(5)
+        time.sleep(4)
         
         r = session.get(url_get, headers=headers, timeout=15)
         c = r.text.strip()
@@ -134,20 +133,28 @@ def baixar_xml_original(session, chave):
 def processar_lote_bg(task_id, chaves):
     zip_buf = io.BytesIO()
     sucessos = 0
-    with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
-        with requests.Session() as sess:
-            with ThreadPoolExecutor(max_workers=15) as exe:
-                futures = {exe.submit(baixar_xml_original, sess, c): c for c in chaves}
-                for i, j in enumerate(as_completed(futures)):
-                    ok, ch, xml_data = j.result()
-                    if ok:
-                        zf.writestr(f"{ch}.xml", xml_data)
-                        sucessos += 1
-                    tarefas_download[task_id]['processados'] = i + 1
-    
-    tarefas_download[task_id]['sucessos'] = sucessos
-    tarefas_download[task_id]['concluido'] = True
-    tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
+    try:
+        with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
+            with requests.Session() as sess:
+                # O SEGREDO ESTÁ AQUI: Aumenta a capacidade de portas do Python
+                adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+                sess.mount('https://', adapter)
+                
+                with ThreadPoolExecutor(max_workers=10) as exe:
+                    futures = {exe.submit(baixar_xml_original, sess, c): c for c in chaves}
+                    for i, j in enumerate(as_completed(futures)):
+                        ok, ch, xml_data = j.result()
+                        if ok and xml_data:
+                            zf.writestr(f"{ch}.xml", xml_data)
+                            sucessos += 1
+                        tarefas_download[task_id]['processados'] = i + 1
+    except Exception as e:
+        print(f"Erro Crítico: {e}")
+    finally:
+        # Garante que vai destravar a tela do cliente mesmo que caia um meteoro
+        tarefas_download[task_id]['sucessos'] = sucessos
+        tarefas_download[task_id]['concluido'] = True
+        tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
 
 @app.route('/api/iniciar-download', methods=['POST'])
 def iniciar_download():
@@ -162,12 +169,13 @@ def iniciar_download():
     
     if saldo_atual < custo_total: return jsonify({"erro": "Saldo insuficiente"}), 402
     
-    # Desconta e Inicia
+    # Desconta o saldo e salva no BD
     novo_saldo = saldo_atual - custo_total
     user_ref.update({'saldo': novo_saldo})
     
     task_id = str(uuid.uuid4())
     tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False, 'zip_bytes': None}
+    
     threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
     
     return jsonify({"task_id": task_id, "novo_saldo": novo_saldo})
