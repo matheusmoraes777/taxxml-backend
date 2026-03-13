@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import zipfile
+import io
 import threading
 import datetime
 import requests
@@ -37,9 +38,8 @@ PRECO_POR_XML = 0.08
 
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# Memória RAM Blindada
+# Memória RAM Simples e Estável
 tarefas_download = {}
-lock_progresso = threading.Lock()
 
 # ==========================================
 # ROTAS DE USUÁRIO E SALDO
@@ -114,10 +114,9 @@ def verificar_pagamento(pay_id):
     except Exception: return jsonify({"erro": "erro"}), 500
 
 # ==========================================
-# MOTOR BASEADO NA LÓGICA DO HP VICTUS 🚀
+# MOTOR SEGURO (BASEADO NO SEU DESKTOP)
 # ==========================================
 def processar_uma_chave_victus(session, chave):
-    """Sua lógica de extração, com retentativas e pausas, adaptada para Nuvem"""
     headers = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
     url_get = f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}"
     url_add = f"https://api.meudanfe.com.br/v2/fd/add/{chave}"
@@ -130,7 +129,6 @@ def processar_uma_chave_victus(session, chave):
                 conteudo_bruto = r.text.strip()
                 xml_limpo = None
 
-                # Auto-Reparo igual ao seu Desktop
                 if conteudo_bruto.startswith('{'):
                     try:
                         js = r.json()
@@ -139,22 +137,19 @@ def processar_uma_chave_victus(session, chave):
                 elif conteudo_bruto.startswith('<'):
                     xml_limpo = conteudo_bruto
 
-                # Validação
                 if xml_limpo and "<nfeProc" in xml_limpo:
                     return True, chave, xml_limpo.encode('utf-8')
                 else:
-                    # Na primeira falha, enfileira na Sefaz e espera
                     if tentativa == 0:
                         session.put(url_add, headers=headers, timeout=12)
-                    time.sleep(3) # Pausa crucial que você tinha no seu código
+                    time.sleep(3) 
                     
             elif r.status_code == 404:
-                # Adiciona na fila se der 404 e espera
                 if tentativa == 0:
                     session.put(url_add, headers=headers, timeout=12)
                 time.sleep(3)
             else:
-                time.sleep(2) # Respeito ao Rate Limit
+                time.sleep(2) 
                 
         except Exception:
             time.sleep(2)
@@ -167,11 +162,10 @@ def processar_lote_bg(task_id, chaves):
     try:
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             with requests.Session() as session:
-                # Evita erro de conexão fechada
                 adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
                 session.mount('https://', adapter)
                 
-                # A MÁGICA ESTÁ AQUI: max_workers=4 (Igual ao seu HP Victus!)
+                # 4 Trabalhadores: O número mágico que a Sefaz aceita sem travar
                 with ThreadPoolExecutor(max_workers=4) as exe:
                     futuros = {exe.submit(processar_uma_chave_victus, session, c): c for c in chaves}
                     
@@ -182,18 +176,15 @@ def processar_lote_bg(task_id, chaves):
                                 zf.writestr(f"{ch}.xml", xml_data)
                         except: pass
                         
-                        # Atualiza RAM segura com Cadeado
-                        with lock_progresso:
-                            if task_id in tarefas_download:
-                                tarefas_download[task_id]['processados'] += 1
+                        if task_id in tarefas_download:
+                            tarefas_download[task_id]['processados'] += 1
 
     except Exception as e:
         print(f"Erro Crítico Motor: {e}")
     finally:
-        with lock_progresso:
-            if task_id in tarefas_download:
-                tarefas_download[task_id]['concluido'] = True
-                tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
+        if task_id in tarefas_download:
+            tarefas_download[task_id]['concluido'] = True
+            tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
 
 @app.route('/api/iniciar-download', methods=['POST'])
 def iniciar_download():
@@ -212,9 +203,7 @@ def iniciar_download():
     user_ref.update({'saldo': novo_saldo})
     
     task_id = str(uuid.uuid4())
-    
-    with lock_progresso:
-        tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False, 'zip_bytes': None}
+    tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False, 'zip_bytes': None}
     
     threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
     
@@ -222,18 +211,15 @@ def iniciar_download():
 
 @app.route('/api/progresso/<task_id>', methods=['GET'])
 def ver_progresso(task_id):
-    with lock_progresso:
-        tarefa = tarefas_download.get(task_id)
-        if tarefa:
-            return jsonify({"processados": tarefa['processados'], "total": tarefa['total'], "concluido": tarefa['concluido']})
+    tarefa = tarefas_download.get(task_id)
+    if tarefa: return jsonify(tarefa)
     return jsonify({"erro": "Aguardando..."}), 404
 
 @app.route('/api/baixar-zip/<task_id>', methods=['GET'])
 def baixar_zip(task_id):
-    with lock_progresso:
-        tarefa = tarefas_download.get(task_id)
-        if tarefa and tarefa.get('zip_bytes'):
-            return send_file(io.BytesIO(tarefa['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
+    tarefa = tarefas_download.get(task_id)
+    if tarefa and tarefa.get('zip_bytes'):
+        return send_file(io.BytesIO(tarefa['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
     return jsonify({"erro": "Arquivo expirou"}), 404
 
 @app.route('/api/admin/stats', methods=['GET'])
