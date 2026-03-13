@@ -2,7 +2,6 @@ import os
 import time
 import uuid
 import zipfile
-import io
 import threading
 import datetime
 import requests
@@ -38,8 +37,12 @@ PRECO_POR_XML = 0.08
 
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# Memória RAM Simples e Estável
+# ==========================================
+# GESTÃO DE MEMÓRIA E DISCO (BLINDADO)
+# ==========================================
+os.makedirs("tmp_zips", exist_ok=True) # Pasta física para salvar os ZIPs sem usar RAM
 tarefas_download = {}
+lock_progresso = threading.Lock() # Trava para organizar a fila perfeitamente
 
 # ==========================================
 # ROTAS DE USUÁRIO E SALDO
@@ -114,16 +117,17 @@ def verificar_pagamento(pay_id):
     except Exception: return jsonify({"erro": "erro"}), 500
 
 # ==========================================
-# MOTOR SEGURO (BASEADO NO SEU DESKTOP)
+# MOTOR SEGURO SEM USO DE "SESSION"
 # ==========================================
-def processar_uma_chave_victus(session, chave):
+def processar_uma_chave_segura(chave):
     headers = { "Api-Key": API_KEY_MEU_DANFE, "Content-Type": "application/json" }
     url_get = f"https://api.meudanfe.com.br/v2/fd/get/xml/{chave}"
     url_add = f"https://api.meudanfe.com.br/v2/fd/add/{chave}"
 
     for tentativa in range(3):
         try:
-            r = session.get(url_get, headers=headers, timeout=12)
+            # Substituímos a "Session" problemática por requests isolados (Seguro em nuvem)
+            r = requests.get(url_get, headers=headers, timeout=15)
             
             if r.status_code == 200:
                 conteudo_bruto = r.text.strip()
@@ -141,12 +145,12 @@ def processar_uma_chave_victus(session, chave):
                     return True, chave, xml_limpo.encode('utf-8')
                 else:
                     if tentativa == 0:
-                        session.put(url_add, headers=headers, timeout=12)
+                        requests.put(url_add, headers=headers, timeout=15)
                     time.sleep(3) 
                     
             elif r.status_code == 404:
                 if tentativa == 0:
-                    session.put(url_add, headers=headers, timeout=12)
+                    requests.put(url_add, headers=headers, timeout=15)
                 time.sleep(3)
             else:
                 time.sleep(2) 
@@ -157,34 +161,32 @@ def processar_uma_chave_victus(session, chave):
     return False, chave, None
 
 def processar_lote_bg(task_id, chaves):
-    zip_buf = io.BytesIO()
+    caminho_zip = f"tmp_zips/{task_id}.zip" # Salva no DISCO, não na RAM
     
     try:
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            with requests.Session() as session:
-                adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
-                session.mount('https://', adapter)
+        with zipfile.ZipFile(caminho_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Apenas 3 trabalhadores para a Sefaz e o Render não bloquearem
+            with ThreadPoolExecutor(max_workers=3) as exe:
+                futuros = {exe.submit(processar_uma_chave_segura, c): c for c in chaves}
                 
-                # 4 Trabalhadores: O número mágico que a Sefaz aceita sem travar
-                with ThreadPoolExecutor(max_workers=4) as exe:
-                    futuros = {exe.submit(processar_uma_chave_victus, session, c): c for c in chaves}
+                for future in as_completed(futuros):
+                    try:
+                        ok, ch, xml_data = future.result()
+                        if ok and xml_data:
+                            zf.writestr(f"{ch}.xml", xml_data)
+                    except: pass
                     
-                    for future in as_completed(futuros):
-                        try:
-                            ok, ch, xml_data = future.result()
-                            if ok and xml_data:
-                                zf.writestr(f"{ch}.xml", xml_data)
-                        except: pass
-                        
+                    # Atualiza o contador de forma atômica
+                    with lock_progresso:
                         if task_id in tarefas_download:
                             tarefas_download[task_id]['processados'] += 1
 
     except Exception as e:
         print(f"Erro Crítico Motor: {e}")
     finally:
-        if task_id in tarefas_download:
-            tarefas_download[task_id]['concluido'] = True
-            tarefas_download[task_id]['zip_bytes'] = zip_buf.getvalue()
+        with lock_progresso:
+            if task_id in tarefas_download:
+                tarefas_download[task_id]['concluido'] = True
 
 @app.route('/api/iniciar-download', methods=['POST'])
 def iniciar_download():
@@ -203,7 +205,7 @@ def iniciar_download():
     user_ref.update({'saldo': novo_saldo})
     
     task_id = str(uuid.uuid4())
-    tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False, 'zip_bytes': None}
+    tarefas_download[task_id] = {'processados': 0, 'total': len(chaves), 'concluido': False}
     
     threading.Thread(target=processar_lote_bg, args=(task_id, chaves)).start()
     
@@ -211,16 +213,17 @@ def iniciar_download():
 
 @app.route('/api/progresso/<task_id>', methods=['GET'])
 def ver_progresso(task_id):
-    tarefa = tarefas_download.get(task_id)
-    if tarefa: return jsonify(tarefa)
+    with lock_progresso:
+        tarefa = tarefas_download.get(task_id)
+        if tarefa: return jsonify(tarefa)
     return jsonify({"erro": "Aguardando..."}), 404
 
 @app.route('/api/baixar-zip/<task_id>', methods=['GET'])
 def baixar_zip(task_id):
-    tarefa = tarefas_download.get(task_id)
-    if tarefa and tarefa.get('zip_bytes'):
-        return send_file(io.BytesIO(tarefa['zip_bytes']), mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
-    return jsonify({"erro": "Arquivo expirou"}), 404
+    caminho_zip = f"tmp_zips/{task_id}.zip"
+    if os.path.exists(caminho_zip):
+        return send_file(caminho_zip, mimetype='application/zip', as_attachment=True, download_name='TaxXML_Lote.zip')
+    return jsonify({"erro": "Arquivo expirou ou não foi gerado"}), 404
 
 @app.route('/api/admin/stats', methods=['GET'])
 def admin_stats():
